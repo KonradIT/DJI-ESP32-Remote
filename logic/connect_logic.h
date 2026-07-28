@@ -1,6 +1,7 @@
 #ifndef __CONNECT_LOGIC_H__
 #define __CONNECT_LOGIC_H__
 
+#include <stdbool.h>
 #include "ble.h"  // For scan_mode_t
 
 typedef enum {
@@ -37,6 +38,10 @@ int connect_logic_protocol_connect(int camera_index, uint32_t device_id, uint8_t
 
 int connect_logic_ble_wakeup(void);
 esp_err_t connect_logic_start_wake_broadcast_for_slot(int camera_index);
+
+/* Gate the 1 Hz session keepalive: it only pings a slot whose session has been
+ * opened with 0x00/0x2b [04 00]. Cleared automatically when the link drops. */
+void connect_logic_set_session_open(int camera_index, bool open);
 
 /* Boot scan functions for single unified boot scan */
 int connect_logic_start_boot_scan(void);

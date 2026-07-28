@@ -18,6 +18,18 @@ esp_err_t data_wait_for_result_by_seq(uint16_t seq, int timeout_ms, void **out_r
 
 esp_err_t data_wait_for_result_by_cmd(uint8_t cmd_set, uint8_t cmd_id, int timeout_ms, uint16_t *out_seq, void **out_result, size_t *out_result_length);
 
+/*
+ * Camera-pushed status frames (and unsolicited responses to our polls) are
+ * delivered to the status callback as one malloc'd tagged blob per frame.
+ * The handler owns the blob and must free() it.
+ */
+typedef struct {
+    uint8_t  cmd_set;
+    uint8_t  cmd_id;
+    uint16_t payload_len;
+    uint8_t  payload[];
+} osmo_push_blob_t;
+
 typedef void (*camera_status_update_cb_t)(int camera_index, void *data);
 void data_register_status_update_callback(camera_status_update_cb_t callback);
 

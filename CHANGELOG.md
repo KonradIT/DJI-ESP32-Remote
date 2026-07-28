@@ -2,6 +2,43 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **DJI Osmo Nano support via the DUML "MEDIA" protocol** — the camera
+  protocol was reverse-engineered from the [Osmosis](https://github.com/KonradIT/Osmosis)
+  project and reimplemented on-device. See `docs/osmo-nano-protocol.md`.
+  - New DUML frame codec (`protocol/duml.*`) — SOF `0x55`, CRC8 (seed `0x77`)
+    + CRC16 (seed `0x3692`), big-endian sequence. Verified against captured
+    DJI Mimo frames.
+  - New Osmo command layer (`protocol/osmo_duml.*`) — addressing, pairing
+    payload, session/wake/keepalive constants.
+  - Connect flow replaced with the Nano session sequence: session-open →
+    SetPairingPIN (on-screen approval) → wake → 1 Hz keepalive, plus auto-ack
+    of camera-originated requests.
+  - Camera control over DUML: start/stop recording (`0x02/0x20` / `0x02/0x21`),
+    take photo (`0x02/0x01`), set/cycle mode (`0x02/0x02`).
+  - Status ingestion rewritten for the Nano pushes (`0x02/0x80` recording +
+    storage, `0x02/0xA0` record time, `0x02/0xDC` storage, `0x0D/0x02`
+    battery).
+  - BLE scan classification rewritten detect if a scanned hit is a DJI camera  only if it carries the DJI
+    company id (`0x08AA`/`0xF7AA`) or the Xtra OUI `EC:9E:EA`, no longer the R-SDK-only
+    `0xFA` byte.
+  - Pairing uses this remote's own identifier and the on-screen token `DRMT`
+    (not the Osmosis app's shared `osmo` identity).
+- **PlatformIO build support** — `platformio.ini` with per-board environments
+  alongside the existing ESP-IDF/CMake flow. See `docs/platformio.md`.
+
+### Removed
+
+- **DJI R-SDK protocol layer** — `protocol/dji_protocol_parser.*`,
+  `dji_protocol_data_processor.*` and `dji_protocol_data_descriptors.*` are
+  deleted, and the DJI CRC16/CRC32 utils are dropped from the build (the Osmo
+  Nano does not speak R-SDK). The packed structs in
+  `dji_protocol_data_structures.h` are retained as the `command_logic_*`
+  return types.
+
 ## [v1.2.0]
 
 ### Added

@@ -999,9 +999,6 @@ static int ui_perform_complete_reconnection(int camera_index, bool show_messages
             if (show_messages && !skip_intermediate_ui) {
                 ui_show_shutter_bottom_message("Connected!", M5_COLOR_GREEN, 1000);
             }
-            /* Enable real-time camera status monitoring */
-            subscript_camera_status(camera_index, PUSH_MODE_PERIODIC_WITH_STATE_CHANGE, PUSH_FREQ_2HZ);
-            
             // Clear the "not found during boot" flag since camera is now connected
             extern void connect_logic_clear_slot_not_found_flag(int slot_index);
             connect_logic_clear_slot_not_found_flag(camera_index);
@@ -1145,9 +1142,6 @@ static int ui_perform_boot_scan_connection(int camera_index) {
         );
         
         if (res == 0) {
-            /* Enable real-time camera status monitoring */
-            subscript_camera_status(camera_index, PUSH_MODE_PERIODIC_WITH_STATE_CHANGE, PUSH_FREQ_2HZ);
-            
             // Clear the "not found during boot" flag since camera is now connected
             extern void connect_logic_clear_slot_not_found_flag(int slot_index);
             connect_logic_clear_slot_not_found_flag(camera_index);

@@ -53,7 +53,9 @@ typedef struct {
     uint16_t notify_char_handle;
     uint16_t write_char_handle;
     uint16_t read_char_handle;
-    uint16_t cccd_handle;
+    uint16_t cccd_handle;        /* CCCD of the notify char (0xFFF4) */
+    uint16_t cccd_handle_write;  /* CCCD of the write char (0xFFF5) — the camera
+                                  * expects notifications enabled on this too */
 
     uint16_t service_start_handle;
     uint16_t service_end_handle;

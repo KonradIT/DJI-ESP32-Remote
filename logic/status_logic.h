@@ -21,8 +21,6 @@ bool is_camera_recording();
 
 void print_camera_status();
 
-int subscript_camera_status(int camera_index, uint8_t push_mode, uint8_t push_freq);
-
 void update_camera_state_handler(int camera_index, void *data);
 
 void update_new_camera_state_handler(int camera_index, void *data);

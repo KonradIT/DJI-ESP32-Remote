@@ -44,6 +44,10 @@ typedef enum {
  *   - Production: APP_LOG_LEVEL_ERROR or APP_LOG_LEVEL_NONE
  */
 #ifndef APP_DEFAULT_LOG_LEVEL
+/* Release default. Protocol work needs INFO — that is the level the connection/
+ * pairing trace and the DEBUG_DUML_PACKETS frame dumps are logged at — so build
+ * with -DAPP_DEFAULT_LOG_LEVEL=APP_LOG_LEVEL_INFO alongside
+ * -DDEBUG_DUML_PACKETS=1 (see platformio.ini). */
 #define APP_DEFAULT_LOG_LEVEL APP_LOG_LEVEL_ERROR
 #endif
 

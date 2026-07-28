@@ -43,10 +43,25 @@
 
 #include "data.h"
 #include "ble.h"
-#include "dji_protocol_parser.h"
+#include "duml.h"
+#include "osmo_duml.h"
 
 /* Logging tag for ESP_LOG functions */
 #define TAG "DATA"
+
+/*
+ * Minimum gap between writes to the camera's 0xFFF5 characteristic.
+ * 0xFFF5 is write-without-response: the Osmo Nano silently drops
+ * back-to-back frames, so every TX path funnels through paced_ble_write().
+ */
+/*
+ * Mimo's own BLE snoop spaces consecutive writes 18-40 ms apart (pairing at
+ * t=0, wake at +39.4 ms), so 100 ms was over-cautious and stretched our whole
+ * handshake ~3x versus the sequence the camera expects. 30 ms keeps
+ * back-to-back frames from being dropped on this write-without-response
+ * characteristic while still matching Mimo's cadence.
+ */
+#define TX_MIN_GAP_MS 30
 
 /* Maximum number of concurrent command/response pairs that can be tracked
  * Limits memory usage and prevents resource exhaustion
@@ -98,6 +113,13 @@ typedef struct {
 
     // Last access timestamp for LRU policy
     TickType_t last_access_time;
+
+    // True while a task is blocked on `sem` inside data_wait_for_result_by_*().
+    // An awaiting entry must never be evicted (LRU) or reaped (cleanup timer):
+    // freeing it would vSemaphoreDelete() a semaphore the waiter is blocked on
+    // and free parse_result out from under it (use-after-free). The waiter
+    // clears this flag and frees the entry itself, always under s_map_mutex.
+    bool awaiting;
 } entry_t;
 
 /* Maintains mapping from seq to parsed results */
@@ -126,6 +148,72 @@ typedef struct {
 static void notify_processing_task(void *pvParameters);
 static void process_notification_data(int camera_index, const uint8_t *raw_data, size_t raw_data_length);
 
+/* Per-camera TX pacing state (see TX_MIN_GAP_MS) */
+#define DATA_MAX_CAMERAS 3
+static SemaphoreHandle_t s_tx_lock[DATA_MAX_CAMERAS];
+static TickType_t s_last_tx_tick[DATA_MAX_CAMERAS];
+
+/**
+ * @brief Paced write to the camera's 0xFFF5 characteristic
+ *
+ * Serializes writes per camera and enforces a minimum inter-frame gap so
+ * consecutive frames are not dropped by the write-without-response transport.
+ */
+static esp_err_t paced_ble_write(int camera_index, const uint8_t *data, size_t length) {
+    if (camera_index < 0 || camera_index >= DATA_MAX_CAMERAS) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* Never write before GATT discovery has resolved the write handle: an ATT
+     * write to handle 0 wedges the camera's ATT bearer and kills the link. */
+    uint16_t write_handle = ble_get_write_handle(camera_index);
+    if (write_handle == 0) {
+        ESP_LOGW(TAG, "Camera %d: write handle not discovered yet, dropping frame", camera_index);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (s_tx_lock[camera_index]) {
+        xSemaphoreTake(s_tx_lock[camera_index], portMAX_DELAY);
+    }
+
+    TickType_t now = xTaskGetTickCount();
+    TickType_t gap = now - s_last_tx_tick[camera_index];
+    if (s_last_tx_tick[camera_index] != 0 && gap < pdMS_TO_TICKS(TX_MIN_GAP_MS)) {
+        vTaskDelay(pdMS_TO_TICKS(TX_MIN_GAP_MS) - gap);
+    }
+
+    /*
+     * DIAGNOSTIC (TX_USE_WRITE_REQUEST): 0xFFF5 is a write-without-response
+     * characteristic, but a Write Command gives the peer no way to report an
+     * ATT error — and the camera currently tears the link down ~1 s after our
+     * first write to it. Using a Write Request makes the camera's ATT status
+     * visible (e.g. insufficient authentication/encryption) in
+     * on_write_complete(). Set to 0 for normal operation.
+     */
+#define TX_USE_WRITE_REQUEST 0
+#if TX_USE_WRITE_REQUEST
+    esp_err_t ret = ble_write_with_response(
+        ble_get_conn_id(camera_index),
+        write_handle,
+        data,
+        length
+    );
+#else
+    esp_err_t ret = ble_write_without_response(
+        ble_get_conn_id(camera_index),
+        write_handle,
+        data,
+        length
+    );
+#endif
+    s_last_tx_tick[camera_index] = xTaskGetTickCount();
+
+    if (s_tx_lock[camera_index]) {
+        xSemaphoreGive(s_tx_lock[camera_index]);
+    }
+    return ret;
+}
+
 /**
  * @brief Initialize seq_entries and mark all entries as unused
  */
@@ -137,6 +225,7 @@ static void reset_entries(void) {
         s_entries[i].cmd_set = 0;
         s_entries[i].cmd_id = 0;
         s_entries[i].last_access_time = 0;
+        s_entries[i].awaiting = false;
         if (s_entries[i].parse_result) {
             free(s_entries[i].parse_result);
             s_entries[i].parse_result = NULL;
@@ -196,6 +285,7 @@ static void free_entry(entry_t *entry) {
         entry->cmd_set = 0;
         entry->cmd_id = 0;
         entry->last_access_time = 0;
+        entry->awaiting = false;
         if (entry->parse_result) {
             free(entry->parse_result);
             entry->parse_result = NULL;
@@ -215,9 +305,12 @@ static void free_entry(entry_t *entry) {
  * @return entry_t* Pointer to allocated entry, NULL if failed
  */
 static entry_t* allocate_entry_by_seq(uint16_t seq) {
-    // First check if an entry with the same seq exists
+    // First check if an entry with the same seq exists. Never reuse one that a
+    // waiter is blocked on (awaiting) — freeing it would be a use-after-free.
+    // With an atomic generate_seq() two in-flight entries cannot share a seq,
+    // so a match here is a stale entry; the awaiting guard is defensive.
     entry_t *existing_entry = find_entry_by_seq(seq);
-    if (existing_entry) {
+    if (existing_entry && !existing_entry->awaiting) {
         ESP_LOGI(TAG, "Overwriting existing entry for seq=0x%04X", seq);
         free_entry(existing_entry);
     }
@@ -237,6 +330,7 @@ static entry_t* allocate_entry_by_seq(uint16_t seq) {
             s_entries[i].cmd_id = 0;
             s_entries[i].parse_result = NULL;
             s_entries[i].parse_result_length = 0;
+            s_entries[i].awaiting = false;
             s_entries[i].sem = xSemaphoreCreateBinary();
             if (s_entries[i].sem == NULL) {
                 ESP_LOGE(TAG, "Failed to create semaphore for seq=0x%04X", seq);
@@ -247,8 +341,9 @@ static entry_t* allocate_entry_by_seq(uint16_t seq) {
             return &s_entries[i];
         }
 
-        // Track the least recently used entry
-        if (s_entries[i].last_access_time < oldest_access_time) {
+        // Track the least recently used entry — but never evict one a waiter is
+        // blocked on (awaiting), or its semaphore/result would be freed under it.
+        if (!s_entries[i].awaiting && s_entries[i].last_access_time < oldest_access_time) {
             oldest_access_time = s_entries[i].last_access_time;
             oldest_entry = &s_entries[i];
         }
@@ -269,6 +364,7 @@ static entry_t* allocate_entry_by_seq(uint16_t seq) {
         oldest_entry->cmd_id = 0;
         oldest_entry->parse_result = NULL;
         oldest_entry->parse_result_length = 0;
+        oldest_entry->awaiting = false;
         oldest_entry->sem = xSemaphoreCreateBinary();
         if (oldest_entry->sem == NULL) {
             ESP_LOGE(TAG, "Failed to create semaphore for seq=0x%04X", seq);
@@ -279,6 +375,7 @@ static entry_t* allocate_entry_by_seq(uint16_t seq) {
         return oldest_entry;
     }
 
+    ESP_LOGW(TAG, "No evictable entry for seq=0x%04X (all awaiting)", seq);
     return NULL;
 }
 
@@ -318,6 +415,7 @@ static entry_t* allocate_entry_by_cmd(uint8_t cmd_set, uint8_t cmd_id) {
             s_entries[i].cmd_id = cmd_id;
             s_entries[i].parse_result = NULL;
             s_entries[i].parse_result_length = 0;
+            s_entries[i].awaiting = false;
             s_entries[i].sem = xSemaphoreCreateBinary();
             if (s_entries[i].sem == NULL) {
                 ESP_LOGE(TAG, "Failed to create semaphore for cmd_set=0x%04X cmd_id=0x%04X", cmd_set, cmd_id);
@@ -328,8 +426,9 @@ static entry_t* allocate_entry_by_cmd(uint8_t cmd_set, uint8_t cmd_id) {
             return &s_entries[i];
         }
 
-        // Only consider non-seq-based entries as deletion candidates
-        if (!s_entries[i].is_seq_based && s_entries[i].last_access_time < oldest_access_time) {
+        // Only evict non-seq-based entries, and never one a waiter is blocked on
+        if (!s_entries[i].is_seq_based && !s_entries[i].awaiting &&
+            s_entries[i].last_access_time < oldest_access_time) {
             oldest_access_time = s_entries[i].last_access_time;
             oldest_entry = &s_entries[i];
         }
@@ -350,6 +449,7 @@ static entry_t* allocate_entry_by_cmd(uint8_t cmd_set, uint8_t cmd_id) {
         oldest_entry->cmd_id = cmd_id;
         oldest_entry->parse_result = NULL;
         oldest_entry->parse_result_length = 0;
+        oldest_entry->awaiting = false;
         oldest_entry->sem = xSemaphoreCreateBinary();
         if (oldest_entry->sem == NULL) {
             ESP_LOGE(TAG, "Failed to create semaphore for cmd_set=0x%04X cmd_id=0x%04X", cmd_set, cmd_id);
@@ -379,9 +479,11 @@ static void cleanup_old_entries(TimerHandle_t xTimer) {
         ESP_LOGE(TAG, "Failed to take mutex in cleanup");
         return;
     }
-    // Check each entry for expiration
+    // Check each entry for expiration. Never reap an entry a waiter is still
+    // blocked on (awaiting) — the waiter owns its lifetime.
     for (int i = 0; i < MAX_SEQ_ENTRIES; i++) {
-        if (s_entries[i].in_use && (current_time - s_entries[i].last_access_time) > pdMS_TO_TICKS(MAX_ENTRY_AGE * 1000)) {
+        if (s_entries[i].in_use && !s_entries[i].awaiting &&
+            (current_time - s_entries[i].last_access_time) > pdMS_TO_TICKS(MAX_ENTRY_AGE * 1000)) {
             if (s_entries[i].is_seq_based) {
                 ESP_LOGI(TAG, "Cleaning up unused entry seq=0x%04X", s_entries[i].seq);
             } else {
@@ -408,6 +510,15 @@ void data_init(void) {
 
     // Clear all entries
     reset_entries();
+
+    // Per-camera TX pacing locks
+    for (int i = 0; i < DATA_MAX_CAMERAS; i++) {
+        s_tx_lock[i] = xSemaphoreCreateMutex();
+        s_last_tx_tick[i] = 0;
+        if (s_tx_lock[i] == NULL) {
+            ESP_LOGE(TAG, "Failed to create TX lock for camera %d", i);
+        }
+    }
 
     // Initialize timer for cleaning up expired entries
     cleanup_timer = xTimerCreate("cleanup_timer", pdMS_TO_TICKS(CLEANUP_INTERVAL_MS), pdTRUE, NULL, cleanup_old_entries);
@@ -444,21 +555,28 @@ bool is_data_layer_initialized(void) {
 }
 
 /**
- * @brief Send data frame with response
- * 
- * Send data frame to device via BLE and wait for response.
- * 
+ * @brief Send a DUML frame and track its sequence number for a response
+ *
+ * The GATT write itself is always write-without-response (0xFFF5 offers no
+ * other property on the Osmo Nano); "with response" here means a seq entry
+ * is kept so the caller can data_wait_for_result_by_seq() for the camera's
+ * DUML-level response frame (flags 0xC0).
+ *
  * @param camera_index Camera slot index (0-2)
  * @param seq Frame sequence number
  * @param raw_data Data to be sent
  * @param raw_data_length Length of data
- * 
+ *
  * @return esp_err_t ESP_OK on success, error code on failure
  */
 esp_err_t data_write_with_response(int camera_index, uint16_t seq, const uint8_t *raw_data, size_t raw_data_length) {
     // Validate input parameters
     if (!raw_data || raw_data_length == 0) {
         ESP_LOGE(TAG, "Invalid data or length");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (camera_index < 0 || camera_index >= DATA_MAX_CAMERAS) {
+        ESP_LOGE(TAG, "Invalid camera index: %d", camera_index);
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -478,23 +596,11 @@ esp_err_t data_write_with_response(int camera_index, uint16_t seq, const uint8_t
 
     xSemaphoreGive(s_map_mutex);
 
-    // Validate camera index
-    if (camera_index < 0 || camera_index >= 3) {
-        ESP_LOGE(TAG, "Invalid camera index: %d", camera_index);
-        return ESP_ERR_INVALID_ARG;
-    }
-    
-    // Send write command with response to the specified camera
-    esp_err_t ret = ble_write_with_response(
-        ble_get_conn_id(camera_index),           // Connection ID for specified camera
-        ble_get_write_handle(camera_index),      // Write characteristic handle for specified camera
-        raw_data,                                 // Data to be sent
-        raw_data_length                           // Length of data
-    );
+    esp_err_t ret = paced_ble_write(camera_index, raw_data, raw_data_length);
 
     // Handle write failure
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "ble_write_with_response failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "paced_ble_write failed: %s", esp_err_to_name(ret));
         // Clean up on failure
         if (xSemaphoreTake(s_map_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             free_entry(entry);
@@ -519,60 +625,23 @@ esp_err_t data_write_with_response(int camera_index, uint16_t seq, const uint8_t
  * @return esp_err_t ESP_OK on success, error code on failure
  */
 esp_err_t data_write_without_response(int camera_index, uint16_t seq, const uint8_t *raw_data, size_t raw_data_length) {
+    (void)seq;   /* fire-and-forget: no response tracking */
+
     // Validate input parameters
     if (!raw_data || raw_data_length == 0) {
         ESP_LOGE(TAG, "Invalid raw_data or raw_data_length");
         return ESP_ERR_INVALID_ARG;
     }
-
-    // Take mutex for thread safety
-    if (xSemaphoreTake(s_map_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
-        ESP_LOGE(TAG, "Failed to take mutex");
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    // Allocate an entry for this sequence
-    entry_t *entry = allocate_entry_by_seq(seq);
-    if (!entry) {
-        ESP_LOGE(TAG, "No free entry, can't write");
-        xSemaphoreGive(s_map_mutex);
-        return ESP_ERR_NO_MEM;
-    }
-
-    xSemaphoreGive(s_map_mutex);
-
-    // Validate camera index
-    if (camera_index < 0 || camera_index >= 3) {
+    if (camera_index < 0 || camera_index >= DATA_MAX_CAMERAS) {
         ESP_LOGE(TAG, "Invalid camera index: %d", camera_index);
         return ESP_ERR_INVALID_ARG;
     }
-    
-    // Send write command without response to the specified camera
-    esp_err_t ret = ble_write_without_response(
-        ble_get_conn_id(camera_index),           // Connection ID for specified camera
-        ble_get_write_handle(camera_index),      // Write characteristic handle for specified camera
-        raw_data,                                 // Data to be sent
-        raw_data_length                           // Length of data
-    );
 
-    // Handle write failure
+    esp_err_t ret = paced_ble_write(camera_index, raw_data, raw_data_length);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "ble_write_without_response failed: %s", esp_err_to_name(ret));
-        // Clean up on failure
-        if (xSemaphoreTake(s_map_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            free_entry(entry);
-            xSemaphoreGive(s_map_mutex);
-        }
-        return ret;
+        ESP_LOGE(TAG, "paced_ble_write failed: %s", esp_err_to_name(ret));
     }
-
-    // For write without response, release entry immediately
-    if (xSemaphoreTake(s_map_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        free_entry(entry);
-        xSemaphoreGive(s_map_mutex);
-    }
-
-    return ESP_OK;
+    return ret;
 }
 
 /**
@@ -609,51 +678,48 @@ esp_err_t data_wait_for_result_by_seq(uint16_t seq, int timeout_ms, void **out_r
         entry_t *entry = find_entry_by_seq(seq);
 
         if (entry) {
-            // Increase reference count to prevent release during waiting
+            // Mark as awaiting so no allocator/cleanup can free this entry (and
+            // delete its semaphore) while we are blocked on it, then release the
+            // mutex and block. `sem` and `entry` stay valid because awaiting
+            // pins the slot.
+            entry->awaiting = true;
+            SemaphoreHandle_t sem = entry->sem;
             xSemaphoreGive(s_map_mutex);
 
-            // Wait for semaphore to be released
-            if (xSemaphoreTake(entry->sem, timeout_ticks) != pdTRUE) {
+            BaseType_t got = xSemaphoreTake(sem, timeout_ticks);
+
+            // Re-take the mutex for all entry access; the notify task writes
+            // parse_result under it. portMAX_DELAY so we always clear awaiting
+            // and free the slot (never leak it on a transient mutex miss).
+            xSemaphoreTake(s_map_mutex, portMAX_DELAY);
+            entry->awaiting = false;
+
+            if (got != pdTRUE) {
                 ESP_LOGW(TAG, "Wait for seq=0x%04X timed out", seq);
-                if (xSemaphoreTake(s_map_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    free_entry(entry);
-                    xSemaphoreGive(s_map_mutex);
-                }
+                free_entry(entry);
+                xSemaphoreGive(s_map_mutex);
                 return ESP_ERR_TIMEOUT;
             }
 
-            // Get parsing result
+            esp_err_t rc;
             if (entry->parse_result) {
-                // Allocate new memory for out_result
                 *out_result = malloc(entry->parse_result_length);
-                if (*out_result == NULL) {
+                if (*out_result != NULL) {
+                    memcpy(*out_result, entry->parse_result, entry->parse_result_length);
+                    *out_result_length = entry->parse_result_length;
+                    rc = ESP_OK;
+                } else {
                     ESP_LOGE(TAG, "Failed to allocate memory for out_result");
-                    if (xSemaphoreTake(s_map_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                        free_entry(entry);
-                        xSemaphoreGive(s_map_mutex);
-                    }
-                    return ESP_ERR_NO_MEM;
+                    rc = ESP_ERR_NO_MEM;
                 }
-
-                // Copy entry->parse_result data to out_result
-                memcpy(*out_result, entry->parse_result, entry->parse_result_length);
-                *out_result_length = entry->parse_result_length;  // Set length
             } else {
                 ESP_LOGE(TAG, "Parse result is NULL for seq=0x%04X", seq);
-                if (xSemaphoreTake(s_map_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    free_entry(entry);
-                    xSemaphoreGive(s_map_mutex);
-                }
-                return ESP_ERR_NOT_FOUND;
+                rc = ESP_ERR_NOT_FOUND;
             }
 
-            // Free entry
-            if (xSemaphoreTake(s_map_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                free_entry(entry);
-                xSemaphoreGive(s_map_mutex);
-            }
-
-            return ESP_OK;
+            free_entry(entry);
+            xSemaphoreGive(s_map_mutex);
+            return rc;
         }
 
         // Check for timeout if entry not found
@@ -727,66 +793,45 @@ esp_err_t data_wait_for_result_by_cmd(uint8_t cmd_set, uint8_t cmd_id, int timeo
                 return ESP_OK;
             }
             
-            // Entry exists but no result yet, need to wait
+            // Entry exists but no result yet — pin it (awaiting) so no allocator
+            // frees its semaphore while we block, then wait. `entry` stays valid
+            // across the block because awaiting prevents eviction/cleanup.
+            entry->awaiting = true;
             SemaphoreHandle_t sem_to_wait = entry->sem;
             xSemaphoreGive(s_map_mutex);
-            
-            // Wait for semaphore to be released
-            if (xSemaphoreTake(sem_to_wait, timeout_ticks) != pdTRUE) {
+
+            BaseType_t got = xSemaphoreTake(sem_to_wait, timeout_ticks);
+
+            xSemaphoreTake(s_map_mutex, portMAX_DELAY);
+            entry->awaiting = false;
+
+            if (got != pdTRUE) {
                 ESP_LOGW(TAG, "Wait for cmd_set=0x%04X cmd_id=0x%04X timed out", cmd_set, cmd_id);
-                // Try to clean up the entry if it still exists
-                if (xSemaphoreTake(s_map_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    entry_t *timeout_entry = find_entry_by_cmd_id(cmd_set, cmd_id);
-                    if (timeout_entry) {
-                        free_entry(timeout_entry);
-                    }
-                    xSemaphoreGive(s_map_mutex);
-                }
-                return ESP_ERR_TIMEOUT;
-            }
-            
-            // Re-acquire mutex to get the result
-            if (xSemaphoreTake(s_map_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
-                ESP_LOGE(TAG, "Failed to take mutex after semaphore wait");
-                return ESP_ERR_INVALID_STATE;
-            }
-            
-            // Find entry again after waiting
-            entry = find_entry_by_cmd_id(cmd_set, cmd_id);
-            if (!entry) {
-                ESP_LOGE(TAG, "Entry not found after semaphore wait");
-                xSemaphoreGive(s_map_mutex);
-                return ESP_ERR_NOT_FOUND;
-            }
-            
-            // Get parsing result
-            if (entry->parse_result) {
-                // Allocate new memory for out_result
-                *out_result = malloc(entry->parse_result_length);
-                if (*out_result == NULL) {
-                    ESP_LOGE(TAG, "Failed to allocate memory for out_result");
-                    free_entry(entry);
-                    xSemaphoreGive(s_map_mutex);
-                    return ESP_ERR_NO_MEM;
-                }
-                // Copy entry->parse_result data to out_result
-                memcpy(*out_result, entry->parse_result, entry->parse_result_length);
-                *out_result_length = entry->parse_result_length;
-            } else {
-                ESP_LOGE(TAG, "Parse result is NULL for cmd_set=0x%04X cmd_id=0x%04X", cmd_set, cmd_id);
                 free_entry(entry);
                 xSemaphoreGive(s_map_mutex);
-                return ESP_ERR_NOT_FOUND;
+                return ESP_ERR_TIMEOUT;
             }
 
-            // Save sequence number
-            *out_seq = entry->seq;
+            esp_err_t rc;
+            if (entry->parse_result) {
+                *out_result = malloc(entry->parse_result_length);
+                if (*out_result != NULL) {
+                    memcpy(*out_result, entry->parse_result, entry->parse_result_length);
+                    *out_result_length = entry->parse_result_length;
+                    *out_seq = entry->seq;
+                    rc = ESP_OK;
+                } else {
+                    ESP_LOGE(TAG, "Failed to allocate memory for out_result");
+                    rc = ESP_ERR_NO_MEM;
+                }
+            } else {
+                ESP_LOGE(TAG, "Parse result is NULL for cmd_set=0x%04X cmd_id=0x%04X", cmd_set, cmd_id);
+                rc = ESP_ERR_NOT_FOUND;
+            }
 
-            // Free entry
             free_entry(entry);
             xSemaphoreGive(s_map_mutex);
-
-            return ESP_OK;
+            return rc;
         }
 
         // Check for timeout if entry not found
@@ -844,128 +889,232 @@ static void notify_processing_task(void *pvParameters) {
 }
 
 /**
- * @brief Process notification data (moved from interrupt context to task context)
- * 
- * This function contains the original logic from receive_camera_notify_handler
- * 
+ * @brief Is this (cmd_set, cmd_id) a status frame the status layer wants?
+ */
+static bool is_status_frame(uint8_t cmd_set, uint8_t cmd_id) {
+    if (cmd_set == OSMO_CMDSET_CAMERA) {
+        return cmd_id == OSMO_CMDID_STATUS_PUSH ||
+               cmd_id == OSMO_CMDID_STATE_QUERY ||
+               cmd_id == OSMO_CMDID_STATUS_POLL ||
+               cmd_id == OSMO_CMDID_STORAGE_PUSH;
+    }
+    /* Named config pushes (cam_video_param_v2 = resolution + fps, …). These
+     * only start arriving once the per-parameter subscribe is sent, which is
+     * why this filter never needed the case before. */
+    if (cmd_set == OSMO_CMDSET_SESSION && cmd_id == OSMO_CMDID_CFG_ITEM) {
+        return true;
+    }
+    return cmd_set == OSMO_CMDSET_BATTERY && cmd_id == OSMO_CMDID_BATTERY_PUSH;
+}
+
+/**
+ * @brief Deliver a frame's payload to the status layer as a tagged blob
+ *
+ * The registered callback owns the blob and must free() it.
+ */
+static void dispatch_status_blob(int camera_index, const duml_frame_t *frame) {
+    if (!status_update_callback || !is_status_frame(frame->cmd_set, frame->cmd_id)) {
+        return;
+    }
+    osmo_push_blob_t *blob = malloc(sizeof(osmo_push_blob_t) + frame->payload_len);
+    if (blob == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate status blob");
+        return;
+    }
+    blob->cmd_set = frame->cmd_set;
+    blob->cmd_id = frame->cmd_id;
+    blob->payload_len = frame->payload_len;
+    if (frame->payload_len > 0) {
+        memcpy(blob->payload, frame->payload, frame->payload_len);
+    }
+    status_update_callback(camera_index, blob);
+}
+
+/**
+ * @brief Answer a camera-originated REQUEST frame (flags 0x40)
+ *
+ * The camera drops the link (~6 s) if its requests go unanswered.  Reply
+ * with flags 0xC0, destination = the request's source, the request's seq,
+ * and the request's payload echoed back — except the 0x00/0x81 device-info
+ * exchange, which expects our "APP" identity blob.
+ */
+/*
+ * DIAGNOSTIC: set to 0 to answer NO camera-originated requests.
+ *
+ * Across every capture the camera's BLE GATT wedges within ~100-400 ms of our
+ * reply to its 0x00/0x81 device-info request, and the passive probe (which
+ * never paired, so was never asked) survived 24 s. This isolates whether our
+ * auto-ack reply is what kills it.
+ */
+#define AUTO_ACK_ENABLED 1
+
+static void auto_ack_request(int camera_index, const duml_frame_t *req) {
+#if !AUTO_ACK_ENABLED
+    ESP_LOGW(TAG, "AUTO-ACK DISABLED: not answering request 0x%02X/0x%02X from 0x%02X",
+             req->cmd_set, req->cmd_id, req->src);
+    (void)camera_index;
+    return;
+#else
+    const uint8_t *payload = req->payload;
+    size_t payload_len = req->payload_len;
+
+    if (req->cmd_set == OSMO_CMDSET_SESSION && req->cmd_id == OSMO_CMDID_DEVICE_INFO) {
+        payload = OSMO_APP_DEVICE_INFO;
+        payload_len = OSMO_APP_DEVICE_INFO_LEN;
+    }
+
+    /* Swap the request's addresses, exactly as the (hardware-verified) Osmosis
+     * app does: the reply's source is the address the camera used to address
+     * US (req->dst), not a hardcoded 0x02 — the camera talks to several of our
+     * endpoints and rejects a reply that comes from the wrong one. */
+    uint8_t frame_buf[DUML_MAX_FRAME_LEN];
+    size_t frame_len = duml_build_from(frame_buf, sizeof(frame_buf),
+                                       req->dst, req->src, req->seq, OSMO_FLAGS_RESPONSE,
+                                       req->cmd_set, req->cmd_id,
+                                       payload, payload_len);
+    if (frame_len == 0) {
+        ESP_LOGW(TAG, "Auto-ack for 0x%02X/0x%02X too large, skipped", req->cmd_set, req->cmd_id);
+        return;
+    }
+
+    esp_err_t ret = paced_ble_write(camera_index, frame_buf, frame_len);
+    ESP_LOGI(TAG, "Auto-acked request 0x%02X/0x%02X from 0x%02X (plen=%zu): %s",
+             req->cmd_set, req->cmd_id, req->src, payload_len, esp_err_to_name(ret));
+#endif /* AUTO_ACK_ENABLED */
+}
+
+/**
+ * @brief Process one DUML notification frame (task context)
+ *
+ * Frames on 0xFFF4 are DUML (SOF 0x55).  Routing by flags byte:
+ *  - responses (bit7 set): wake the seq-matched waiter; unsolicited
+ *    responses to our fire-and-forget polls go to the status layer
+ *  - requests (0x40): signal any cmd-based waiter (pairing approval is
+ *    delivered this way), then auto-ack so the camera keeps the link up
+ *  - notifies (0x00): status pushes -> status layer
+ *
  * @param camera_index Index of camera sending the notification (0, 1, or 2)
  * @param raw_data Raw notification data
  * @param raw_data_length Data length
  */
-static void process_notification_data(int camera_index, const uint8_t *raw_data, size_t raw_data_length) {
-    // Validate input parameters
-    if (!raw_data || raw_data_length < 2) {
-        ESP_LOGW(TAG, "Notify data is too short or null, skip parse");
+/* Handle one already-parsed DUML frame. Taken by value so the body can use
+ * `frame.` directly; duml_frame_t is small (the payload is a borrowed pointer
+ * into the caller's receive buffer). */
+static void handle_duml_frame(int camera_index, duml_frame_t frame) {
+    /* cam%d matters: with two cameras connected, an unlabelled RX line cannot
+     * be attributed, which made it impossible to tell which body was answering
+     * (or not answering) during the Xtra investigation. */
+#if DEBUG_DUML_PACKETS
+    ESP_LOGI(TAG, "RX cam%d src=0x%02X dst=0x%02X flags=0x%02X cmd=0x%02X/0x%02X seq=0x%04X plen=%u",
+             camera_index, frame.src, frame.dst, frame.cmd_type, frame.cmd_set,
+             frame.cmd_id, frame.seq, frame.payload_len);
+    if (frame.payload_len > 0) {
+        ESP_LOG_BUFFER_HEX_LEVEL(TAG, frame.payload, frame.payload_len, ESP_LOG_INFO);
+    }
+#endif
+
+    if (frame.cmd_type & OSMO_FLAGS_IS_ACK_BIT) {
+        /* Response frame — find the waiter by seq */
+        bool delivered = false;
+        if (xSemaphoreTake(s_map_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            entry_t *entry = find_entry_by_seq(frame.seq);
+            if (entry) {
+                /* Empty acks are represented as one 0x00 status byte so
+                 * waiters always receive a non-NULL result. */
+                size_t result_len = frame.payload_len > 0 ? frame.payload_len : 1;
+                uint8_t *result = malloc(result_len);
+                if (result) {
+                    if (frame.payload_len > 0) {
+                        memcpy(result, frame.payload, frame.payload_len);
+                    } else {
+                        result[0] = 0x00;
+                    }
+                    entry->parse_result = result;
+                    entry->parse_result_length = result_len;
+                    xSemaphoreGive(entry->sem);
+                    delivered = true;
+                } else {
+                    ESP_LOGE(TAG, "No memory for response seq=0x%04X", frame.seq);
+                }
+            }
+            xSemaphoreGive(s_map_mutex);
+        }
+        if (!delivered) {
+            /* Unsolicited response (e.g. to our fire-and-forget status polls) */
+            dispatch_status_blob(camera_index, &frame);
+        }
         return;
     }
 
-    // Check frame header
-    if (raw_data[0] == 0xAA || raw_data[0] == 0xaa) {
-        // Log notification frame details at info level
-        ESP_LOGI(TAG, "RX notification frame (%d bytes):", raw_data_length);
-        // Log raw frame data at info level
-        ESP_LOG_BUFFER_HEX_LEVEL(TAG, raw_data, raw_data_length, ESP_LOG_INFO);
-                                                             
-        // Define parsing result structure
-        protocol_frame_t frame;
-        memset(&frame, 0, sizeof(frame));
-
-        // Call protocol_parse_notification to parse notification frame
-        int ret = protocol_parse_notification(raw_data, raw_data_length, &frame);
-        if (ret != 0) {
-            ESP_LOGE(TAG, "Failed to parse notification frame, error: %d", ret);
-            return;
-        }
-
-        // Parse data segment
-        void *parse_result = NULL;
-        size_t parse_result_length = 0;
-        if (frame.data && frame.data_length > 0) {
-            // Assume protocol_parse_data returns void* type
-            parse_result = protocol_parse_data(frame.data, frame.data_length, frame.cmd_type, &parse_result_length);
-            if (parse_result == NULL) {
-                ESP_LOGD(TAG, "No parsed result for frame (send-only or unknown command)");
-                return;
-            }
-        } else {
-            ESP_LOGW(TAG, "Data segment is empty, skipping data parsing");
-            return;
-        }
-
-        // Get actual seq (assuming frame has seq field)
-        uint16_t actual_seq = frame.seq;
-        uint8_t actual_cmd_set = frame.data[0];
-        uint8_t actual_cmd_id = frame.data[1];
-        ESP_LOGD(TAG, "Parsed seq=0x%04X, cmd_set=0x%02X, cmd_id=0x%02X", actual_seq, actual_cmd_set, actual_cmd_id);
-
-        // Find corresponding entry
+    if (frame.cmd_type & OSMO_FLAGS_REQUEST) {
+        /* Camera-originated request. Deliver to any cmd-based waiter first
+         * (pairing approval 0x07/0x46 arrives as a request), then ack it. */
         if (xSemaphoreTake(s_map_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            entry_t *entry = find_entry_by_seq(actual_seq);
+            entry_t *entry = allocate_entry_by_cmd(frame.cmd_set, frame.cmd_id);
             if (entry) {
-                // Assume parse_result is void* object returned by protocol_parse_data
-                if (parse_result != NULL) {
-                    // Put parsing result into corresponding entry
-                    entry->parse_result = parse_result;  // Store void* result in entry's value field
-                    entry->parse_result_length = parse_result_length; // Record result length
-                    // Wake up waiting task
-                    xSemaphoreGive(entry->sem);
-                } else {
-                    ESP_LOGE(TAG, "Parsing data failed, entry not updated");
-                }
-            } else {
-                // Camera actively pushed notification - reuse or allocate entry by cmd_set/cmd_id
-                entry = allocate_entry_by_cmd(actual_cmd_set, actual_cmd_id);
-                if (entry == NULL) {
-                    ESP_LOGE(TAG, "Failed to allocate entry for seq=0x%04X cmd_set=0x%04X cmd_id=0x%04X", actual_seq, actual_cmd_set, actual_cmd_id);
-                    // Free parse_result since we can't store it
-                    if (parse_result) {
-                        free(parse_result);
-                        parse_result = NULL;
+                size_t result_len = frame.payload_len > 0 ? frame.payload_len : 1;
+                uint8_t *result = malloc(result_len);
+                if (result) {
+                    if (frame.payload_len > 0) {
+                        memcpy(result, frame.payload, frame.payload_len);
+                    } else {
+                        result[0] = 0x00;
                     }
-                } else {
-                    // Store parsing result in entry (ownership transferred)
-                    entry->parse_result = parse_result;
-                    entry->parse_result_length = parse_result_length;
-                    entry->seq = actual_seq;
+                    entry->parse_result = result;
+                    entry->parse_result_length = result_len;
+                    entry->seq = frame.seq;
                     entry->last_access_time = xTaskGetTickCount();
-                    // Wake up any waiting tasks
                     xSemaphoreGive(entry->sem);
                 }
             }
             xSemaphoreGive(s_map_mutex);
         }
+        auto_ack_request(camera_index, &frame);
+        return;
+    }
 
-        // Handle camera actively pushed status
-        if (actual_cmd_set == 0x1D && actual_cmd_id == 0x02 && status_update_callback) {
-            // Create new memory copy for status update callback
-            void *status_copy = NULL;
-            if (parse_result != NULL && parse_result_length > 0) {
-                status_copy = malloc(parse_result_length);
-                if (status_copy != NULL) {
-                    memcpy(status_copy, parse_result, parse_result_length);
-                    status_update_callback(camera_index, status_copy);
-                } else {
-                    ESP_LOGE(TAG, "Failed to allocate memory for status update callback");
-                }
-            }
+    /* Notify / push frame (flags 0x00) */
+    dispatch_status_blob(camera_index, &frame);
+}
+
+/**
+ * @brief Process one BLE notification, which may carry several DUML frames
+ *
+ * The camera coalesces frames into a single notification (e.g. a pairing
+ * response immediately followed by a status push). Walk the buffer frame by
+ * frame instead of parsing only the first one and discarding the rest.
+ */
+static void process_notification_data(int camera_index, const uint8_t *raw_data, size_t raw_data_length) {
+    if (!raw_data || raw_data_length < 2) {
+        ESP_LOGW(TAG, "Notify data is too short or null, skip parse");
+        return;
+    }
+
+    size_t offset = 0;
+    while (offset + DUML_FRAME_OVERHEAD <= raw_data_length) {
+        const uint8_t *p = raw_data + offset;
+        size_t remaining = raw_data_length - offset;
+
+        if (p[0] != DUML_SOF) {
+            /* Not DUML (e.g. R-SDK 0xAA, which the Nano does not speak).
+             * Nothing reliable to resync on, so stop. */
+            ESP_LOGD(TAG, "Ignoring non-DUML data at offset %u (SOF 0x%02X)",
+                     (unsigned)offset, p[0]);
+            return;
         }
 
-        // Handle new camera actively pushed status
-        if (actual_cmd_set == 0x1D && actual_cmd_id == 0x06 && new_status_update_callback) {
-            // Create new memory copy for new status update callback
-            void *new_status_copy = NULL;
-            if (parse_result != NULL && parse_result_length > 0) {
-                new_status_copy = malloc(parse_result_length);
-                if (new_status_copy != NULL) {
-                    memcpy(new_status_copy, parse_result, parse_result_length);
-                    new_status_update_callback(camera_index, new_status_copy);
-                } else {
-                    ESP_LOGE(TAG, "Failed to allocate memory for new status update callback");
-                }
-            }
+        size_t frame_len = duml_frame_len(p, remaining);
+        duml_frame_t frame;
+        if (frame_len < DUML_FRAME_OVERHEAD || frame_len > remaining ||
+            !duml_parse(p, remaining, &frame)) {
+            ESP_LOGW(TAG, "Invalid DUML frame at offset %u (%u bytes left), dropped",
+                     (unsigned)offset, (unsigned)remaining);
+            ESP_LOG_BUFFER_HEX_LEVEL(TAG, p, remaining, ESP_LOG_WARN);
+            return;
         }
-    } else {
-        // ESP_LOGW(TAG, "Received frame does not start with 0xAA, ignoring...");
+
+        handle_duml_frame(camera_index, frame);
+        offset += frame_len;
     }
 }
 

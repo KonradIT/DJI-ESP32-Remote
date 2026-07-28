@@ -40,11 +40,12 @@
 
 #include "ble.h"
 #include "data.h"
+#include "duml.h"
+#include "osmo_duml.h"
 #include "enums_logic.h"
 #include "connect_logic.h"
 #include "command_logic.h"
 #include "status_logic.h"
-#include "dji_protocol_data_structures.h"
 #include "../main/ui.h"  // For camera_state_t and g_camera_states
 
 /* Logging tag for ESP_LOG functions */
@@ -52,6 +53,60 @@
 
 /* Boot scan timeout in milliseconds */
 #define BOOT_SCAN_TIMEOUT_MS 30000
+
+/* DUML pairing token — shown verbatim on the camera screen next to Approve.
+ * "DRMT" (this remote's own token) instead of "osmo", which the Osmosis app
+ * already uses. */
+#define OSMO_PAIRING_TOKEN "DRMT"
+
+/*
+ * Session keepalive: a sleeping/paired Osmo Nano tears the BLE link down ~5-6 s
+ * after it goes quiet, so once connected we ping 0x00/0x2b [01 01] -> 0xF0 at
+ * ~1 Hz for every connected slot, for the whole session.
+ */
+static TaskHandle_t s_keepalive_task = NULL;
+
+/*
+ * Per-slot gate: the [01 01] keepalive may only start AFTER that slot's
+ * session has been opened with [04 00]. Mimo always opens the session first;
+ * pinging a session that was never opened is a state the camera never sees.
+ */
+static volatile bool s_session_open[NUM_CAMERAS] = { false };
+
+void connect_logic_set_session_open(int camera_index, bool open) {
+    if (camera_index >= 0 && camera_index < NUM_CAMERAS) {
+        s_session_open[camera_index] = open;
+    }
+}
+
+static void keepalive_task(void *arg) {
+    (void)arg;
+    while (1) {
+        for (int i = 0; i < NUM_CAMERAS; i++) {
+            if (!ble_is_camera_connected(i)) {
+                s_session_open[i] = false;   /* link gone: require a fresh 04 00 */
+                continue;
+            }
+            /* Require the write handle too: ble_is_camera_connected() goes true
+             * at BLE_GAP_EVENT_CONNECT, long before GATT discovery resolves the
+             * handles. Pinging in that window wrote to ATT handle 0, which
+             * wedged the camera's ATT bearer and killed the link. */
+            if (s_session_open[i] && ble_get_write_handle(i) != 0) {
+                osmo_send(i, DUML_ADDR_SESSION, OSMO_CMDSET_SESSION, OSMO_CMDID_SESSION_PING,
+                          OSMO_FLAGS_REQUEST, OSMO_SESSION_KEEPALIVE, sizeof(OSMO_SESSION_KEEPALIVE));
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+static void start_keepalive(void) {
+    if (s_keepalive_task == NULL) {
+        if (xTaskCreate(keepalive_task, "osmo_keepalive", 3072, NULL, 2, &s_keepalive_task) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create keepalive task");
+        }
+    }
+}
 
 /* Global connection state tracking
  * Manages the current state of BLE and protocol connections
@@ -182,6 +237,11 @@ int connect_logic_ble_init() {
     }
 
     connect_state = BLE_INIT_COMPLETE;
+
+    /* Keepalive runs for the whole session; it no-ops while nothing is
+     * connected and pings each slot once a link comes up. */
+    start_keepalive();
+
     ESP_LOGI(TAG, "BLE init successfully");
     return 0;
 }
@@ -435,162 +495,143 @@ int connect_logic_ble_disconnect(int camera_index) {
 int connect_logic_protocol_connect(int camera_index, uint32_t device_id, uint8_t mac_addr_len, const int8_t *mac_addr,
                                    uint32_t fw_version, uint8_t verify_mode, uint16_t verify_data,
                                    uint8_t camera_reserved) {
-    ESP_LOGI(TAG, "%s: Camera %d: Starting protocol connection", __FUNCTION__, camera_index);
-    uint16_t seq = generate_seq();
+    /* The R-SDK handshake parameters are unused by the Osmo Nano DUML flow. */
+    (void)device_id; (void)mac_addr_len; (void)mac_addr; (void)fw_version;
+    (void)verify_mode; (void)verify_data; (void)camera_reserved;
 
-    /* Construct DJI protocol connection request frame */
-    connection_request_command_frame connection_request = {
-        .device_id = device_id,
-        .mac_addr_len = mac_addr_len,
-        .fw_version = fw_version,
-        .verify_mode = verify_mode,
-        .verify_data = verify_data,
-    };
-    memcpy(connection_request.mac_addr, mac_addr, mac_addr_len);
-
-
-    // STEP1: Send connection request command to camera
-    ESP_LOGI(TAG, "Sending connection request to camera %d...", camera_index);
-    CommandResult result = send_command(camera_index, 0x00, 0x19, CMD_WAIT_RESULT, &connection_request, seq, 1000);
-
-    /**** Connection issue: camera may return either response frame or command frame ****/
-
-    if (result.structure == NULL) {
-        // If a command frame is sent, execute this block of code
-
-        // Directly call data_wait_for_result_by_cmd(0x00, 0x19, 30000, &received_seq, &parse_result, &parse_result_length);
-        
-        // If != OK, it means no message was received, timeout occurred
-        
-        // Otherwise, GOTO wait_for_camera_command label
-        void *parse_result = NULL;
-        size_t parse_result_length = 0;
-        uint16_t received_seq = 0;
-        esp_err_t ret = data_wait_for_result_by_cmd(0x00, 0x19, 1000, &received_seq, &parse_result, &parse_result_length);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Timeout or error waiting for camera connection command, GOTO Failed.");
-            if (camera_index >= 0 && camera_index < 3) {
-                s_slot_is_connecting[camera_index] = false;
-            }
-            connect_logic_ble_disconnect(camera_index);
-            return -1;
-        } else {
-            // If data is received, skip parsing camera response and directly enter STEP3
-            goto wait_for_camera_command;
-        }
-    }
-
-    // STEP2: Parse the response returned from camera
-    connection_request_response_frame *response = (connection_request_response_frame *)result.structure;
-    if (response->ret_code != 0) {
-        ESP_LOGE(TAG, "Connection handshake failed: unexpected response from camera, ret_code: %d", response->ret_code);
-        if (camera_index >= 0 && camera_index < 3) {
-            s_slot_is_connecting[camera_index] = false;
-        }
-        free(response);
-        connect_logic_ble_disconnect(camera_index);
+    if (camera_index < 0 || camera_index >= NUM_CAMERAS) {
         return -1;
     }
+    ESP_LOGI(TAG, "Camera %d: starting Osmo Nano DUML session", camera_index);
 
-    ESP_LOGI(TAG, "Handshake successful, waiting for the camera to actively send the connection command frame...");
-    free(response);
-
-    // STEP3: Wait for camera to send connection request
-wait_for_camera_command:
-    void *parse_result = NULL;
-    size_t parse_result_length = 0;
-    uint16_t received_seq = 0;
-    esp_err_t ret = data_wait_for_result_by_cmd(0x00, 0x19, 30000, &received_seq, &parse_result, &parse_result_length);
-
-    if (ret != ESP_OK || parse_result == NULL) {
-        ESP_LOGE(TAG, "Timeout or error waiting for camera connection command");
-        if (camera_index >= 0 && camera_index < 3) {
-            s_slot_is_connecting[camera_index] = false;
-        }
-        connect_logic_ble_disconnect(camera_index);
-        return -1;
-    }
-
-    // Parse the connection request command sent by camera
-    connection_request_command_frame *camera_request = (connection_request_command_frame *)parse_result;
-    
-    // Extract and save camera's device_id for model identification
-    uint32_t camera_device_id = camera_request->device_id;
-    ESP_LOGI(TAG, "Camera %d device_id: 0x%04X", camera_index, (unsigned int)camera_device_id);
-    
-    // Save device_id to camera state for persistent model name display
-    g_camera_states[camera_index].device_id = camera_device_id;
-    
-    // Set model name based on device_id
-    const char* model_name = ui_get_camera_model_name(camera_device_id);
-    strncpy(g_camera_states[camera_index].model_name, model_name, 
-            sizeof(g_camera_states[camera_index].model_name) - 1);
-    g_camera_states[camera_index].model_name[sizeof(g_camera_states[camera_index].model_name) - 1] = '\0';
-    ESP_LOGI(TAG, "Camera %d identified as: %s", camera_index, model_name);
-
-    if (camera_request->verify_mode != 2) {
-        ESP_LOGE(TAG, "Unexpected verify_mode from camera: %d", camera_request->verify_mode);
-        if (camera_index >= 0 && camera_index < 3) {
-            s_slot_is_connecting[camera_index] = false;
-        }
-        free(parse_result);
-        connect_logic_ble_disconnect(camera_index);
-        return -1;
-    }
-
-    if (camera_request->verify_data == 0) {
-        ESP_LOGI(TAG, "Camera approved the connection, sending response...");
-
-        // Construct connection response frame
-        connection_request_response_frame connection_response = {
-            .device_id = device_id,
-            .ret_code = 0,
-        };
-        memset(connection_response.reserved, 0, sizeof(connection_response.reserved));
-        connection_response.reserved[0] = camera_reserved;
-
-        ESP_LOGI(TAG, "Constructed connection response for camera %d, sending...", camera_index);
-
-        // STEP4: Send connection response frame
-        send_command(camera_index, 0x00, 0x19, ACK_NO_RESPONSE, &connection_response, received_seq, 5000);
-
-        // Set connection state to protocol connected
-        connect_state = PROTOCOL_CONNECTED;
-        
-        // Clear connecting flag - connection is now complete
-        if (camera_index >= 0 && camera_index < 3) {
-            s_slot_is_connecting[camera_index] = false;
-        }
-
-        ESP_LOGI(TAG, "Connection successfully established with camera.");
-        
-        // Subscribe to camera status push (CmdSet=0x1D, CmdID=0x05)
-        // This must be done after handshake completes to receive status updates
-        // The camera will then periodically send status pushes via CmdSet=0x1D, CmdID=0x02
-        ESP_LOGI(TAG, "Subscribing to camera status push (0x1D/0x05)...");
-        extern int subscript_camera_status(int camera_index, uint8_t push_mode, uint8_t push_freq);
-        subscript_camera_status(camera_index, 3, 20);  // PUSH_MODE_PERIODIC_WITH_STATE_CHANGE=3, PUSH_FREQ_2HZ=20
-        
-        // Save camera pairing (including device_id) to NVS for persistence
-        esp_err_t save_err = save_all_cameras_to_nvs();
-        if (save_err == ESP_OK) {
-            ESP_LOGI(TAG, "Camera %d pairing saved to NVS (device_id: 0x%04X)", 
-                     camera_index, (unsigned int)camera_device_id);
-        } else {
-            ESP_LOGW(TAG, "Failed to save camera %d pairing to NVS", camera_index);
-        }
-        
-        free(parse_result);
-        return 0;
+    /* Identify the camera from its BLE advertised name (OsmoNano-XXXX). */
+    const char *dev_name = ble_get_connected_device_name(camera_index);
+    if (dev_name && dev_name[0] != '\0') {
+        strncpy(g_camera_states[camera_index].model_name, dev_name,
+                sizeof(g_camera_states[camera_index].model_name) - 1);
     } else {
-        ESP_LOGW(TAG, "Camera rejected the connection, closing Bluetooth link...");
-        if (camera_index >= 0 && camera_index < 3) {
-            s_slot_is_connecting[camera_index] = false;
-        }
-        free(parse_result);
-        connect_logic_ble_disconnect(camera_index);
-        return -1;
+        strncpy(g_camera_states[camera_index].model_name, "Osmo Nano",
+                sizeof(g_camera_states[camera_index].model_name) - 1);
     }
+    g_camera_states[camera_index].model_name[sizeof(g_camera_states[camera_index].model_name) - 1] = '\0';
+
+    /* STEP 1 — open the session (0x00/0x2b [04 00] -> 0xF0), before pairing.
+     * Only after this may the keepalive task start its [01 01] pings. */
+    osmo_send(camera_index, DUML_ADDR_SESSION, OSMO_CMDSET_SESSION, OSMO_CMDID_SESSION_PING,
+              OSMO_FLAGS_REQUEST, OSMO_SESSION_OPEN, sizeof(OSMO_SESSION_OPEN));
+    connect_logic_set_session_open(camera_index, true);
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    /* STEP 2 — SetPairingPIN (0x07/0x45 -> 0x07). Token shown on the camera. */
+    /*
+     * Fire-and-forget, exactly like Mimo: pairing is written and the NEXT
+     * frame (the wake) follows ~39 ms later. Do NOT block waiting for the
+     * pairing response — the camera does not always answer, and a blocking
+     * wait delayed the wake past the point where the camera gives up
+     * (measured: a 5 s timeout pushed the wake 3.3 s beyond the camera's
+     * death). The response, when it comes, is handled asynchronously by the
+     * data layer; the camera's own status stream tells us whether we are in.
+     */
+    uint8_t pair_payload[64];
+    size_t pair_len = osmo_build_pairing_payload(pair_payload, sizeof(pair_payload), OSMO_PAIRING_TOKEN);
+    bool paired = false;
+    if (pair_len > 0) {
+        uint16_t pair_seq = generate_seq();
+        duml_write_tracked(camera_index, DUML_ADDR_WIFI, OSMO_CMDSET_WIFI, OSMO_CMDID_SET_PAIRING,
+                           pair_payload, pair_len, pair_seq);
+
+        /* Our Nano answers 0x07/0x45 at +232 ms (Mimo's phone saw +21 ms), so
+         * a 35 ms leash missed it entirely and we sent the wake before the
+         * camera had accepted the pairing. 800 ms covers the observed latency
+         * with margin while still bounding the stall. */
+        void *pin = NULL;
+        size_t pin_len = 0;
+        if (data_wait_for_result_by_seq(pair_seq, 800, &pin, &pin_len) == ESP_OK && pin) {
+            uint8_t status = (pin_len >= 2) ? ((uint8_t *)pin)[1] : 0xFF;
+            ESP_LOGI(TAG, "Camera %d: pairing status 0x%02X (%s)", camera_index, status,
+                     status == 0x01 ? "already paired" :
+                     status == 0x02 ? "approve on camera screen" : "unexpected");
+            paired = (status == 0x01 || status == 0x02);
+            free(pin);
+        } else {
+            ESP_LOGW(TAG, "Camera %d: no pairing reply within 800 ms, continuing", camera_index);
+        }
+    }
+
+    /*
+     * STEP 3 — wake / session-activate: 0x53/0x10 [00 00 00 00] -> 0x1C.
+     *
+     * This is REQUIRED, ~40 ms after the pairing response. Analysis of real
+     * DJI Mimo BLE snoops shows the camera answers 01 00 00 00 and only then
+     * enters its live session, at which point it emits 200-300 0x00/0x99
+     * config-item frames. Without this the camera never enters that state and
+     * powers its radio down ~600 ms later — which is exactly the failure we
+     * were chasing.
+     *
+     * An earlier comment here claimed 0x53/0x10 tears the link down; that was
+     * a mis-attribution. What actually triggers the WiFi AP hand-off (and thus
+     * the BLE teardown) is the WiFi-credential fetch 0x07/0x07 + 0x07/0x0E,
+     * which this firmware never sends.
+     */
+    /*
+     * Wake at ~+40 ms after the pairing WRITE — byte-exact from the Mimo snoop
+     * (pairing write t=0, its response +21 ms, wake +39.4 ms). MUST go to
+     * DUML_ADDR_SYSTEM (0x1C): addressed to the camera (0x01) it answers 0xE0.
+     * The camera replies 01 00 00 00 (a structured answer, not the 0xE0 error
+     * stub) and its 0x00/0x99 config flood starts ~126 ms after pairing.
+     */
+    vTaskDelay(pdMS_TO_TICKS(5));
+    osmo_send(camera_index, DUML_ADDR_SYSTEM, OSMO_CMDSET_SYSTEM, OSMO_CMDID_SYSTEM_WAKE,
+              OSMO_FLAGS_REQUEST, (const uint8_t[]){0, 0, 0, 0}, 4);
+
+    /*
+     * 0x00/0x32 -> 0x88 at ~+165 ms, payload ASCII "11" + 3 zero bytes. The
+     * camera answers with a 60-byte device-info block containing its serial —
+     * that reply is the concrete gate proving the session is really alive.
+     * (0x07/0x39 at +271 ms is deliberately NOT sent: the camera answers it
+     * 0xE0 even for Mimo, so it is pure noise.)
+     */
+    vTaskDelay(pdMS_TO_TICKS(125));
+    static const uint8_t session_info_payload[5] = { '1', '1', 0x00, 0x00, 0x00 };
+    osmo_send(camera_index, DUML_ADDR_DM368_4, OSMO_CMDSET_SESSION, OSMO_CMDID_SESSION_INFO,
+              OSMO_FLAGS_REQUEST, session_info_payload, sizeof(session_info_payload));
+
+    /*
+     * Subscribe to the named config parameters (0x00/0x99 -> 0x28), ONE FRAME
+     * PER NAME — the form Mimo uses (verb 0x02). The camera then pushes that
+     * parameter's value and every subsequent change.
+     *
+     * We previously sent a single group subscribe (`01 00 06 00 "camera"`).
+     * The camera ACKed it with plen=0 and never sent an item, which read as
+     * "this channel isn't supported" for days — it was simply malformed.
+     *
+     * This is how resolution/fps (camcap_video_format) are reached; they are
+     * NOT in the 0x02/0x8E pid space.
+     */
+    for (size_t i = 0; i < OSMO_CFG_NAMES_COUNT; i++) {
+        uint8_t sub[64];
+        size_t n = osmo_build_cfg_subscribe(sub, sizeof(sub), (uint32_t)(0xCBD6 + i),
+                                            OSMO_CFG_NAMES[i]);
+        if (n == 0) {
+            ESP_LOGW(TAG, "cfg subscribe: '%s' too long for buffer", OSMO_CFG_NAMES[i]);
+            continue;
+        }
+        vTaskDelay(pdMS_TO_TICKS(60));
+        osmo_send(camera_index, DUML_ADDR_DM368_1, OSMO_CMDSET_SESSION,
+                  OSMO_CMDID_CFG_ITEM, OSMO_FLAGS_REQUEST, sub, n);
+    }
+
+    /* STEP 3 — the session is up; keepalive keeps it alive. */
+    connect_state = PROTOCOL_CONNECTED;
+    s_slot_is_connecting[camera_index] = false;
+
+    ESP_LOGI(TAG, "Camera %d: DUML session established (paired=%d)", camera_index, paired);
+
+    esp_err_t save_err = save_all_cameras_to_nvs();
+    if (save_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to save camera %d pairing to NVS", camera_index);
+    }
+    return 0;
 }
 
 int connect_logic_ble_wakeup(void) {

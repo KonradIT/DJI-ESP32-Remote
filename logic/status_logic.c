@@ -24,9 +24,10 @@
 #include "enums_logic.h"
 #include "connect_logic.h"
 #include "command_logic.h"
-#include "dji_protocol_data_structures.h"
+#include "data.h"
+#include "duml.h"
+#include "osmo_duml.h"
 #include "../main/ui.h"
-#include "../main/m5stack_basic_v27_hal.h"  // For M5_COLOR constants
 
 static const char *TAG = "LOGIC_STATUS";
 
@@ -100,284 +101,185 @@ void print_camera_status() {
     ESP_LOGI(TAG, "=================================================");
 }
 
-/**
- * @brief Subscribe to camera status
- * 
- * @param camera_index Camera index (0, 1, or 2)
- * @param push_mode Subscription mode
- * @param push_freq Subscription frequency
- * @return int Returns 0 on success, -1 on failure
+/*
+ * There is no status subscription on this transport: the Osmo Nano starts
+ * pushing 0x02/0x80 camera status (~10 Hz), 0x02/0xDC storage and 0x0D/0x02
+ * battery the moment notifications are enabled on 0xFFF4, before we send
+ * anything (hardware-confirmed). The old R-SDK 0x1D/0x05 subscribe does not
+ * apply, so no call is needed after connect. Named-config values are a
+ * separate channel — see osmo_build_cfg_subscribe() in connect_logic.c.
  */
-int subscript_camera_status(int camera_index, uint8_t push_mode, uint8_t push_freq) {
-    ESP_LOGI(TAG, "Subscribing to Camera %d Status with push_mode: %d, push_freq: %d", camera_index, push_mode, push_freq);
 
-    if (connect_logic_get_state() != PROTOCOL_CONNECTED) {
-        ESP_LOGE(TAG, "Protocol connection to the camera failed. Current connection state: %d", connect_logic_get_state());
-        return -1;
-    }
-
-    uint16_t seq = generate_seq();
-
-    camera_status_subscription_command_frame command_frame = {
-        .push_mode = push_mode,
-        .push_freq = push_freq,
-        .reserved = {0, 0, 0, 0}
-    };
-
-    send_command(camera_index, 0x1D, 0x05, CMD_NO_RESPONSE, &command_frame, seq, 5000);
-
-    return 0;
+/* Little-endian reads that stay inside the payload */
+static uint32_t rd_u32_le(const uint8_t *p, size_t off, uint16_t len) {
+    if (off + 4 > len) return 0;
+    return (uint32_t)p[off] | ((uint32_t)p[off + 1] << 8) |
+           ((uint32_t)p[off + 2] << 16) | ((uint32_t)p[off + 3] << 24);
+}
+static uint16_t rd_u16_le(const uint8_t *p, size_t off, uint16_t len) {
+    if (off + 2 > len) return 0;
+    return (uint16_t)p[off] | ((uint16_t)p[off + 1] << 8);
 }
 
-/**
- * @brief Update camera state machine (callback function)
- * 
- * Process and update various camera states, check for state changes and print updated information.
- * 
- * @param data Input camera status data
+/*
+ * Ingest one Osmo Nano status push (delivered as an osmo_push_blob_t by data.c)
+ * and update the shared camera_state_t the UI renders.  We map only the fields
+ * the UI consumes: recording flag, remaining SD capacity, elapsed record time,
+ * and battery percent.  Frame layouts are from MEDIA_PROTOCOL.md.
  */
 void update_camera_state_handler(int camera_index, void *data) {
     if (!data) {
-        ESP_LOGE(TAG, "Camera %d: logic_update_camera_state: Received NULL data.", camera_index);
+        ESP_LOGE(TAG, "Camera %d: status update received NULL data", camera_index);
         return;
     }
-
     if (camera_index < 0 || camera_index >= NUM_CAMERAS) {
         ESP_LOGE(TAG, "Invalid camera_index %d in status update", camera_index);
+        free(data);
         return;
     }
 
-    const camera_status_push_command_frame *parsed_data = (const camera_status_push_command_frame *)data;
+    const osmo_push_blob_t *blob = (const osmo_push_blob_t *)data;
+    const uint8_t *p = blob->payload;
+    uint16_t len = blob->payload_len;
+    camera_state_t *cam = &g_camera_states[camera_index];
 
-    // Get reference to this camera's state
-    camera_state_t *cam_state = &g_camera_states[camera_index];
-
-    // Update timestamp of last status push for wake-and-record confirmation
     g_last_status_push_timestamp = xTaskGetTickCount() * portTICK_PERIOD_MS;
-    cam_state->last_status_timestamp = g_last_status_push_timestamp;
+    cam->last_status_timestamp = g_last_status_push_timestamp;
+    bool changed = false;
 
-    bool state_changed = false;
-
-    // Check and update camera mode
-    if (cam_state->camera_mode != parsed_data->camera_mode) {
-        cam_state->camera_mode = parsed_data->camera_mode;
-        ESP_LOGI(TAG, "Camera %d: Camera mode updated to: %d", camera_index, cam_state->camera_mode);
-        state_changed = true;
-        
-        // Update old global for camera 0
-        if (camera_index == 0) {
-            current_camera_mode = parsed_data->camera_mode;
-        }
-    }
-
-    // Check and update camera status
-    // IMPORTANT: Recording state is determined by camera_status field from status push (0x1D/0x02)
-    // Status 0x03 = Recording/Photo in progress, Status 0x05 = Pre-recording
-    // This is the authoritative source - never assume state from command responses
-    if (cam_state->camera_status != parsed_data->camera_status) {
-        uint8_t old_status = cam_state->camera_status;
-        cam_state->camera_status = parsed_data->camera_status;
-        
-        const char *old_status_str = camera_status_to_string((camera_status_t)old_status);
-        const char *new_status_str = camera_status_to_string((camera_status_t)cam_state->camera_status);
-        
-        ESP_LOGI(TAG, "Camera %d status changed: %d (%s) -> %d (%s)", 
-                 camera_index, old_status, old_status_str, cam_state->camera_status, new_status_str);
-        
-        // Log recording state change specifically
-        bool was_recording = (old_status == CAMERA_STATUS_PHOTO_OR_RECORDING || old_status == CAMERA_STATUS_PRE_RECORDING);
-        bool is_now_recording = (cam_state->camera_status == CAMERA_STATUS_PHOTO_OR_RECORDING || cam_state->camera_status == CAMERA_STATUS_PRE_RECORDING);
-        if (was_recording != is_now_recording) {
-            ESP_LOGI(TAG, "Camera %d recording state changed: %s -> %s", 
-                     camera_index,
-                     was_recording ? "RECORDING" : "NOT RECORDING",
-                     is_now_recording ? "RECORDING" : "NOT RECORDING");
-        }
-        
-        // Update is_recording field
-        cam_state->is_recording = is_now_recording;
-        
-        state_changed = true;
-        
-        // Update old global for camera 0
-        if (camera_index == 0) {
-            current_camera_status = parsed_data->camera_status;
-        }
-    }
-
-    // Check and update video resolution
-    if (cam_state->video_resolution != parsed_data->video_resolution) {
-        cam_state->video_resolution = parsed_data->video_resolution;
-        ESP_LOGI(TAG, "Camera %d: Video resolution updated to: %d", camera_index, cam_state->video_resolution);
-        state_changed = true;
-        if (camera_index == 0) current_video_resolution = parsed_data->video_resolution;
-    }
-
-    // Check and update frame rate
-    if (cam_state->fps_idx != parsed_data->fps_idx) {
-        cam_state->fps_idx = parsed_data->fps_idx;
-        ESP_LOGI(TAG, "Camera %d: FPS index updated to: %d", camera_index, cam_state->fps_idx);
-        state_changed = true;
-        if (camera_index == 0) current_fps_idx = parsed_data->fps_idx;
-    }
-
-    // Check and update electronic image stabilization mode
-    if (cam_state->eis_mode != parsed_data->eis_mode) {
-        cam_state->eis_mode = parsed_data->eis_mode;
-        ESP_LOGI(TAG, "Camera %d: EIS mode updated to: %d", camera_index, cam_state->eis_mode);
-        state_changed = true;
-        if (camera_index == 0) current_eis_mode = parsed_data->eis_mode;
-    }
-
-    // Check and update user mode  
-    if (cam_state->user_mode != parsed_data->user_mode) {
-        cam_state->user_mode = parsed_data->user_mode;
-        ESP_LOGI(TAG, "Camera %d: User mode updated to: %d", camera_index, cam_state->user_mode);
-        state_changed = true;
-        if (camera_index == 0) current_user_mode = parsed_data->user_mode;
-    }
-
-    // Check and update camera mode next flag
-    if (cam_state->camera_mode_next_flag != parsed_data->camera_mode_next_flag) {
-        cam_state->camera_mode_next_flag = parsed_data->camera_mode_next_flag;
-        ESP_LOGI(TAG, "Camera %d: Camera mode next flag updated to: %d", camera_index, cam_state->camera_mode_next_flag);
-        state_changed = true;
-        if (camera_index == 0) current_camera_mode_next_flag = parsed_data->camera_mode_next_flag;
-    }
-
-    // Check and update record time
-    if (cam_state->record_time != parsed_data->record_time) {
-        cam_state->record_time = parsed_data->record_time;
-        ESP_LOGI(TAG, "Camera %d: Record time updated to: %d", camera_index, cam_state->record_time);
-        state_changed = true;
-        if (camera_index == 0) current_record_time = parsed_data->record_time;
-    }
-
-    // Check and update timelapse interval
-    if (cam_state->timelapse_interval != parsed_data->timelapse_interval) {
-        cam_state->timelapse_interval = parsed_data->timelapse_interval;
-        ESP_LOGI(TAG, "Camera %d: Timelapse interval updated to: %d", camera_index, cam_state->timelapse_interval);
-        state_changed = true;
-        if (camera_index == 0) current_timelapse_interval = parsed_data->timelapse_interval;
-    }
-
-    // Check and update remain capacity
-    if (cam_state->remain_capacity != parsed_data->remain_capacity) {
-        cam_state->remain_capacity = parsed_data->remain_capacity;
-        ESP_LOGI(TAG, "Camera %d: Remain capacity updated to: %lu MB", camera_index, (unsigned long)cam_state->remain_capacity);
-        state_changed = true;
-        if (camera_index == 0) current_remain_capacity = parsed_data->remain_capacity;
-    }
-
-    // Check and update remain time
-    if (cam_state->remain_time != parsed_data->remain_time) {
-        cam_state->remain_time = parsed_data->remain_time;
-        ESP_LOGI(TAG, "Camera %d: Remain time updated to: %lu seconds", camera_index, (unsigned long)cam_state->remain_time);
-        state_changed = true;
-        if (camera_index == 0) current_remain_time = parsed_data->remain_time;
-    }
-
-    // Check and update camera battery percentage
-    if (cam_state->camera_bat_percentage != parsed_data->camera_bat_percentage) {
-        cam_state->camera_bat_percentage = parsed_data->camera_bat_percentage;
-        cam_state->battery_percentage = parsed_data->camera_bat_percentage; // Also update alias
-        ESP_LOGI(TAG, "Camera %d: Camera battery updated to: %d%%", camera_index, cam_state->camera_bat_percentage);
-        state_changed = true;
-        if (camera_index == 0) current_camera_bat_percentage = parsed_data->camera_bat_percentage;
-    }
-
-    // Check and update power mode
-    // According to DJI DATA Segment protocol (Camera Power Mode Settings, feature ID 001A):
-    // - power_mode = 0: Normal working mode
-    // - power_mode = 3: Sleep mode
-    // When camera is in sleep mode, remote must stop sending commands (except wake commands)
-    // Reference: Osmo-GPS-Controller-Demo, protocol_data_segment.md
-    bool was_sleeping = (cam_state->power_mode == 3);
-    if (cam_state->power_mode != parsed_data->power_mode) {
-        cam_state->power_mode = parsed_data->power_mode;
-        bool prev_is_sleeping = cam_state->is_sleeping;
-        cam_state->is_sleeping = (cam_state->power_mode == 3);
-        
-        // Track sleep state transitions
-        if (prev_is_sleeping != cam_state->is_sleeping) {
-            cam_state->last_sleep_state_change_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-            if (cam_state->is_sleeping) {
-                ESP_LOGI(TAG, "Camera %d: Entered SLEEP mode (power_mode=%d)", camera_index, cam_state->power_mode);
-            } else {
-                ESP_LOGI(TAG, "Camera %d: Woke up from SLEEP mode (power_mode=%d)", camera_index, cam_state->power_mode);
+    if (blob->cmd_set == OSMO_CMDSET_CAMERA && blob->cmd_id == OSMO_CMDID_STATUS_PUSH) {
+        /* 0x02/0x80 camera status — offsets ground-truthed on hardware, see
+         * osmo_duml.h: recording = byte0 bit7, free MiB @9, remaining
+         * recordable seconds @17, elapsed record seconds @29. */
+        if (len > OSMO_STATUS_FLAGS_BYTE) {
+            bool rec = (p[OSMO_STATUS_FLAGS_BYTE] & OSMO_STATUS_RECORDING_MASK) != 0;
+            if (cam->is_recording != rec) {
+                cam->is_recording = rec;
+                cam->camera_status = rec ? CAMERA_STATUS_PHOTO_OR_RECORDING
+                                         : CAMERA_STATUS_LIVE_STREAMING;
+                changed = true;
+                ESP_LOGI(TAG, "Camera %d: recording -> %s", camera_index, rec ? "ON" : "OFF");
+                if (camera_index == 0) current_camera_status = cam->camera_status;
             }
         }
-        
-        ESP_LOGI(TAG, "Camera %d: Power mode updated to: %d (%s)", camera_index, cam_state->power_mode, 
-                 cam_state->is_sleeping ? "SLEEP" : "NORMAL");
-        state_changed = true;
-        if (camera_index == 0) current_power_mode = parsed_data->power_mode;
-    }
-    
-    // Check for wake-up transition (power_mode changed from 3 to 0)
-    bool is_now_sleeping = cam_state->is_sleeping;
-    if (was_sleeping && !is_now_sleeping) {
-        ESP_LOGI(TAG, "LOGIC_STATUS: Camera %d: Woke up from SLEEP (power_mode changed 3 → 0).", camera_index);
-        
-        // Check if snapshot is pending for this camera
-        if (cam_state->snapshot_pending) {
-            // ALWAYS send snapshot key from status handler - this is the single point of responsibility
-            // The queue processor only manages broadcast timing and early termination
-            ESP_LOGI(TAG, "LOGIC_STATUS: Camera %d: Snapshot pending, sending SNAPSHOT key after wake-up", camera_index);
-            
-            // Send snapshot key command
-            extern esp_err_t command_logic_send_snapshot_key_for_slot(int camera_index);
-            esp_err_t snapshot_result = command_logic_send_snapshot_key_for_slot(camera_index);
-            
-            if (snapshot_result == ESP_OK) {
-                ESP_LOGI(TAG, "LOGIC_STATUS: Camera %d: Snapshot key (0x03) sent successfully after wake-up.", camera_index);
-            } else {
-                ESP_LOGE(TAG, "LOGIC_STATUS: Camera %d: Failed to send Snapshot key after wake-up.", camera_index);
-            }
-            
-            // Always clear snapshot pending flag after attempting to send
-            cam_state->snapshot_pending = false;
-            ESP_LOGD(TAG, "LOGIC_STATUS: Camera %d: snapshot_pending cleared (was handled by status handler)", camera_index);
-            
-            // Notify queue processor if this camera was being processed in "All Cameras" mode
-            // This allows early termination of the broadcast and moving to next camera
-            extern int g_current_wake_camera_index;
-            if (g_current_wake_camera_index == camera_index) {
-                extern void wake_queue_notify_camera_woke_up(int camera_index);
-                wake_queue_notify_camera_woke_up(camera_index);
-                ESP_LOGI(TAG, "LOGIC_STATUS: Camera %d: Notified wake queue of early wake-up", camera_index);
+        uint32_t free_mib = rd_u32_le(p, OSMO_STATUS_STORE_FREE_MIB, len);
+        if (free_mib != 0 && cam->remain_capacity != free_mib) {
+            cam->remain_capacity = free_mib;
+            changed = true;
+            if (camera_index == 0) current_remain_capacity = free_mib;
+        }
+        uint16_t rec_s = rd_u16_le(p, OSMO_STATUS_RECORD_TIME_S, len);
+        if (cam->record_time != rec_s) {
+            cam->record_time = rec_s;
+            changed = true;
+            if (camera_index == 0) current_record_time = rec_s;
+        }
+        uint16_t remain_s = rd_u16_le(p, OSMO_STATUS_REMAIN_TIME_S, len);
+        if (remain_s != 0 && cam->remain_time != remain_s) {
+            cam->remain_time = remain_s;
+            changed = true;
+            if (camera_index == 0) current_remain_time = remain_s;
+        }
+        /* @57 echoes the last 0x02/0xE1 written, so it tracks the mode whether
+         * we set it or the user did it on the camera. */
+        if (len > OSMO_STATUS_MODE && cam->shoot_mode != p[OSMO_STATUS_MODE]) {
+            cam->shoot_mode = p[OSMO_STATUS_MODE];
+            changed = true;
+            ESP_LOGI(TAG, "Camera %d: mode -> %s (0x%02X)", camera_index,
+                     osmo_mode_name(cam->shoot_mode), cam->shoot_mode);
+        }
+    } else if (blob->cmd_set == OSMO_CMDSET_SESSION && blob->cmd_id == OSMO_CMDID_CFG_ITEM) {
+        /*
+         * Named config push (0x00/0x99 from 0x28), self-describing:
+         *   02 06 00 00 | idx:u32-LE | 00 00 00 | total_len:u16-LE
+         *   | name_len:u16-LE | name | 00 x6 | value_len:u16-LE | value
+         * Arrives only after a per-parameter subscribe (verb 0x02) — see
+         * osmo_build_cfg_subscribe().
+         */
+        const char *name = NULL;
+        const uint8_t *val = NULL;
+        uint16_t name_len = 0, val_len = 0;
+        if (len >= 15) {
+            name_len = (uint16_t)(p[13] | (p[14] << 8));
+            size_t vlen_off = (size_t)15 + name_len + 6;
+            if (name_len > 0 && vlen_off + 2 <= len) {
+                name = (const char *)&p[15];
+                val_len = (uint16_t)(p[vlen_off] | (p[vlen_off + 1] << 8));
+                if (vlen_off + 2 + val_len <= len) {
+                    val = &p[vlen_off + 2];
+                }
             }
         }
+        if (name && val) {
+            /* Log every named push once so unmapped parameters can be decoded
+             * from the log without another firmware round-trip. */
+#if DEBUG_DUML_PACKETS
+            /* Names + values of every config push — this is how an unmapped
+             * setting (EIS, colour mode, …) gets decoded from a log. */
+            ESP_LOG_BUFFER_HEX_LEVEL(TAG, val, val_len > 24 ? 24 : val_len, ESP_LOG_INFO);
+            ESP_LOGI(TAG, "cfg cam%d '%.*s' (%u B)", camera_index, (int)name_len, name, val_len);
+#endif
+            /* cam_video_param_v2: [resolution:u8][fps_idx:u8]… — the current
+             * video setting. (camcap_video_format is the *capability* list of
+             * supported pairs, not the active one.) */
+            if (name_len == 18 && strncmp(name, "cam_video_param_v2", 18) == 0 && val_len >= 2) {
+                if (cam->video_resolution != val[0] || cam->fps_idx != val[1]) {
+                    cam->video_resolution = val[0];
+                    cam->fps_idx = val[1];
+                    changed = true;
+                    ESP_LOGI(TAG, "Camera %d: video %u @ fps_idx %u",
+                             camera_index, val[0], val[1]);
+                    if (camera_index == 0) {
+                        current_video_resolution = val[0];
+                        current_fps_idx = val[1];
+                    }
+                }
+            }
+        }
+    } else if (blob->cmd_set == OSMO_CMDSET_CAMERA && blob->cmd_id == OSMO_CMDID_STATE_QUERY) {
+        /* 0x02/0xA0 state query response: record_time u16 @6 */
+        uint16_t rt = rd_u16_le(p, OSMO_STATE_RECORD_TIME_S, len);
+        if (cam->record_time != rt) {
+            cam->record_time = rt;
+            changed = true;
+            if (camera_index == 0) current_record_time = rt;
+        }
+    } else if (blob->cmd_set == OSMO_CMDSET_CAMERA && blob->cmd_id == OSMO_CMDID_STORAGE_PUSH) {
+        /* 0x02/0xDC storage: SD free @10 if a card is present, else internal @28 */
+        uint32_t sd_total = rd_u32_le(p, OSMO_STORAGE_SD_TOTAL, len);
+        uint32_t free_mib = (sd_total > 0) ? rd_u32_le(p, OSMO_STORAGE_SD_FREE, len)
+                                           : rd_u32_le(p, OSMO_STORAGE_INT_FREE, len);
+        if (free_mib != 0 && cam->remain_capacity != free_mib) {
+            cam->remain_capacity = free_mib;
+            changed = true;
+            if (camera_index == 0) current_remain_capacity = free_mib;
+        }
+    } else if (blob->cmd_set == OSMO_CMDSET_BATTERY && blob->cmd_id == OSMO_CMDID_BATTERY_PUSH) {
+        /* 0x0D/0x02 battery: percent u8 @20 */
+        if (len > OSMO_BATT_PERCENT) {
+            uint8_t pct = p[OSMO_BATT_PERCENT];
+            if (pct <= 100 && cam->camera_bat_percentage != pct) {
+                cam->camera_bat_percentage = pct;
+                cam->battery_percentage = pct;
+                changed = true;
+                ESP_LOGI(TAG, "Camera %d: battery -> %d%%", camera_index, pct);
+                if (camera_index == 0) current_camera_bat_percentage = pct;
+            }
+        }
+    } else {
+        ESP_LOGD(TAG, "Camera %d: unhandled status 0x%02X/0x%02X (%u B)",
+                 camera_index, blob->cmd_set, blob->cmd_id, len);
     }
 
-    // Mark camera state as initialized
-    bool was_just_initialized = false;
-    if (!cam_state->is_initialized) {
-        cam_state->is_initialized = true;
-        ESP_LOGI(TAG, "Camera %d state fully updated and marked as initialized.", camera_index);
-        state_changed = true;  // Force status print as this is initialization
-        was_just_initialized = true;
-        
-        // Also mark global flag for camera 0
-        if (camera_index == 0 && !camera_status_initialized) {
-            camera_status_initialized = true;
-        }
+    if (!cam->is_initialized) {
+        cam->is_initialized = true;
+        changed = true;
+        if (camera_index == 0) camera_status_initialized = true;
+        ESP_LOGI(TAG, "Camera %d status initialized", camera_index);
     }
 
-    // If state changed or first initialization, request UI update
-    if (state_changed) {
-        // Only print for camera 0 to avoid log spam
-        if (camera_index == 0) {
-            print_camera_status();
-        } else {
-            ESP_LOGI(TAG, "Camera %d status updated", camera_index);
-        }
-        
-        // Request UI update (always on Main screen now)
-        // The UI's selective update logic will handle what actually needs redrawing
+    if (changed) {
         g_ui_state.display_needs_update = true;
-        
-        (void)was_just_initialized;
     }
 
     free(data);

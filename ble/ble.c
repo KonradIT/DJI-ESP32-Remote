@@ -15,6 +15,7 @@
 
 #include <string.h>
 #include <stdint.h>
+#include <ctype.h>
 #include "ble.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -34,6 +35,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "esp_timer.h"
 
 #define TAG "BLE"
@@ -50,6 +52,67 @@ static struct ble_gap_event_listener s_global_listener;
 
 static ble_notify_callback_t s_notify_cb = NULL;
 static connect_logic_state_callback_t s_state_cb = NULL;
+
+/*
+ * Link-event dispatch.
+ *
+ * The disconnect callback (connect_logic's reconnect logic) blocks for ~10 s.
+ * Running it inline in gap_event_cb() would stall the NimBLE host task for
+ * that whole time — no advertisement reports, no GATT events, so every
+ * reconnect attempt "timed out" while the host was simply not running.
+ * Dispatch it to this task instead and keep the GAP callback non-blocking.
+ */
+static QueueHandle_t s_link_evt_queue = NULL;
+static TaskHandle_t  s_link_evt_task = NULL;
+
+typedef enum {
+    LINK_EVT_DISCONNECTED = 0,
+} link_evt_type_t;
+
+typedef struct {
+    link_evt_type_t type;
+} link_evt_t;
+
+/* Timestamp of the last notification received, so a disconnect can report how
+ * long the peer had been silent — this distinguishes "camera stopped talking"
+ * from "our controller stalled". */
+static int64_t s_last_rx_us = 0;
+
+/*
+ * Minimum BLE supervision timeout, in 10 ms units (2000 = 20 s).
+ *
+ * NimBLE's default is ~2.56 s and the camera asks for 2.0 s (Nano) / 5.0 s
+ * (Xtra). Mimo on Android runs a much longer timeout, so if the camera simply
+ * stops transmitting for several seconds (e.g. re-tuning its radio) Android
+ * rides it out while we drop the link. Being patient costs nothing and tells
+ * us whether the camera's silence is transient or terminal.
+ */
+#define BLE_SUPERVISION_TIMEOUT_FLOOR 2000
+
+/* Connection parameters we request, instead of passing NULL (= NimBLE
+ * defaults). Interval 30-50 ms matches what the cameras ask for anyway. */
+static const struct ble_gap_conn_params s_conn_params = {
+    .scan_itvl = 0x0060,
+    .scan_window = 0x0030,
+    .itvl_min = 24,     /* 30 ms */
+    .itvl_max = 40,     /* 50 ms */
+    .latency = 0,
+    .supervision_timeout = BLE_SUPERVISION_TIMEOUT_FLOOR,
+    .min_ce_len = 0,
+    .max_ce_len = 0,
+};
+
+static void link_evt_task(void *arg) {
+    (void)arg;
+    link_evt_t evt;
+    while (1) {
+        if (xQueueReceive(s_link_evt_queue, &evt, portMAX_DELAY) == pdTRUE) {
+            if (evt.type == LINK_EVT_DISCONNECTED && s_state_cb) {
+                s_state_cb();
+            }
+        }
+    }
+}
 
 static scan_controller_t s_scan_controller = {
     .mode = SCAN_MODE_IDLE,
@@ -185,13 +248,68 @@ static const uint8_t* find_adv_field(const uint8_t *data, uint8_t data_len,
     return NULL;
 }
 
-static uint8_t is_dji_camera_adv(const uint8_t *data, uint8_t data_len) {
+/*
+ * DJI company id, little-endian in the manufacturer AD: 0xAA 0x08 (standard)
+ * or 0xAA 0xF7 (Xtra Edge Pro rebrand).  The Osmo Nano advertises
+ * `AA 08 | 19 00 00 <6-byte MAC> 03` — model id 0x0019 at mfg[2..3].  The old
+ * R-SDK filter also required mfg[4]==0xFA, which the Nano does NOT set, so it
+ * was rejected; match on the company id alone and classify by name/model id.
+ */
+static bool dji_mfg_matches(const uint8_t *mfg, uint8_t mfg_len) {
+    return mfg && mfg_len >= 4 && mfg[0] == 0xAA && (mfg[1] == 0x08 || mfg[1] == 0xF7);
+}
+
+/* Case-insensitive "haystack contains needle" (needle must be lowercase). */
+static bool name_has_ci(const char *hay, const char *needle) {
+    size_t nl = strlen(needle);
+    if (nl == 0) return false;
+    for (const char *p = hay; *p; p++) {
+        size_t i = 0;
+        while (i < nl && p[i] && (char)tolower((unsigned char)p[i]) == needle[i]) {
+            i++;
+        }
+        if (i == nl) return true;
+    }
+    return false;
+}
+
+/*
+ * Classify a scan result as a DJI Osmo camera. A hit requires ONE of:
+ *   1. DJI manufacturer company id 0x08AA / 0xF7AA (little-endian AA 08 / AA F7);
+ *   2. the Xtra rebrand OUI EC:9E:EA (bda_be = peer MAC, MSB first, may be NULL);
+ *   3. a *real advertised name* containing a camera keyword (the Pocket 3 sends
+ *      no manufacturer data).
+ */
+static uint8_t is_dji_camera_adv(const uint8_t *data, uint8_t data_len, const uint8_t *bda_be) {
     uint8_t mfg_len = 0;
     const uint8_t *mfg = find_adv_field(data, data_len,
                                          BLE_HS_ADV_TYPE_MFG_DATA, &mfg_len);
-    if (mfg && mfg_len >= 5 &&
-        mfg[0] == 0xAA && mfg[1] == 0x08 && mfg[4] == 0xFA) {
+    if (dji_mfg_matches(mfg, mfg_len)) {
         return 1;
+    }
+
+    if (bda_be && bda_be[0] == 0xEC && bda_be[1] == 0x9E && bda_be[2] == 0xEA) {
+        return 1;   /* Xtra Edge Pro OUI */
+    }
+
+    uint8_t name_len = 0;
+    const uint8_t *name = find_adv_field(data, data_len,
+                                          BLE_HS_ADV_TYPE_COMP_NAME, &name_len);
+    if (!name || name_len == 0) {
+        name = find_adv_field(data, data_len,
+                               BLE_HS_ADV_TYPE_INCOMP_NAME, &name_len);
+    }
+    if (name && name_len > 0) {
+        char buf[64];
+        size_t copy_len = name_len < sizeof(buf) - 1 ? name_len : sizeof(buf) - 1;
+        memcpy(buf, name, copy_len);
+        buf[copy_len] = '\0';
+        if (name_has_ci(buf, "osmo")   || name_has_ci(buf, "nano")  ||
+            name_has_ci(buf, "dji")    || name_has_ci(buf, "pocket") ||
+            name_has_ci(buf, "action") || name_has_ci(buf, "xtra")  ||
+            name_has_ci(buf, "edge")) {
+            return 1;
+        }
     }
     return 0;
 }
@@ -200,8 +318,8 @@ static uint32_t get_dji_device_id(const uint8_t *data, uint8_t data_len) {
     uint8_t mfg_len = 0;
     const uint8_t *mfg = find_adv_field(data, data_len,
                                          BLE_HS_ADV_TYPE_MFG_DATA, &mfg_len);
-    if (mfg && mfg_len >= 5 &&
-        mfg[0] == 0xAA && mfg[1] == 0x08 && mfg[4] == 0xFA) {
+    if (dji_mfg_matches(mfg, mfg_len)) {
+        /* model id, little-endian at mfg[2..3] (0x0019 = Osmo Nano) */
         return (uint32_t)((uint16_t)mfg[2] | ((uint16_t)mfg[3] << 8));
     }
     return 0;
@@ -273,6 +391,24 @@ static int on_mtu_exchanged(uint16_t conn_handle,
         ESP_LOGW(TAG, "Camera %d: MTU exchange status=%d, using default", camera_index, error->status);
     }
     ESP_LOGI(TAG, "Camera %d: MTU=%d", camera_index, mtu);
+
+    /*
+     * Offer to encrypt the link — after MTU, before discovery.
+     *
+     * NOT required: retested with every bond wiped, the link runs
+     * encrypted=0 bonded=0 with SMP never running and the camera still accepts
+     * record/mode commands. An earlier revision claimed encryption was THE
+     * root cause; it was enabled in the same session as the real fixes (both
+     * CCCDs, the 0xFFF4 arm write, flags 0x40, MTU 500, the 800 ms pairing
+     * wait) and wrongly got the credit. Kept because it is harmless and some
+     * bodies may want it.
+     *
+     * Fire-and-forget on purpose, and it must stay after the MTU exchange:
+     * calling it from the connect event stalls the ATT bearer for 20 s on a
+     * camera that never answers SMP. Discovery starts below either way.
+     */
+    int src = ble_gap_security_initiate(conn_handle);
+    ESP_LOGD(TAG, "Camera %d: security_initiate rc=%d", camera_index, src);
 
     /* Discover ALL services (not just 0xFFF0) to match Bluedroid's
        esp_ble_gattc_search_service(NULL) behavior. Some peripherals
@@ -346,15 +482,22 @@ static int on_chr_discovered(uint16_t conn_handle,
             ESP_LOGI(TAG, "Camera %d: Char 0x%04X found, handle=0x%x (def=0x%x)",
                      camera_index, uuid16, chr->val_handle, chr->def_handle);
         }
+        /* props: 0x04=WRITE_NO_RSP 0x08=WRITE 0x10=NOTIFY 0x20=INDICATE */
+        ESP_LOGI(TAG, "Camera %d:   0x%04X props=0x%02x%s%s%s%s",
+                 camera_index, uuid16, chr->properties,
+                 (chr->properties & 0x04) ? " WRITE_NO_RSP" : "",
+                 (chr->properties & 0x08) ? " WRITE" : "",
+                 (chr->properties & 0x10) ? " NOTIFY" : "",
+                 (chr->properties & 0x20) ? " INDICATE" : "");
     } else if (error->status == BLE_HS_EDONE) {
         if (profile->notify_char_handle != 0) {
-            uint16_t dsc_end = profile->service_end_handle;
-            if (profile->write_char_handle > profile->notify_char_handle) {
-                dsc_end = profile->write_char_handle - 1;
-            }
+            /* Discover descriptors across the WHOLE service. This used to stop
+             * at write_char_handle-1, which meant 0xFFF5's own CCCD was never
+             * found — and the camera expects a client subscribed to BOTH
+             * 0xFFF4 and 0xFFF5 (as the verified Osmosis app does). */
             ble_gattc_disc_all_dscs(conn_handle,
                                      profile->notify_char_handle,
-                                     dsc_end,
+                                     profile->service_end_handle,
                                      on_dsc_discovered, arg);
         } else {
             s_active_scan_camera_index = -1;
@@ -375,16 +518,24 @@ static int on_dsc_discovered(uint16_t conn_handle,
 
     if (error->status == 0 && dsc != NULL) {
         if (ble_uuid_cmp(&dsc->uuid.u, &s_cccd_uuid.u) == 0) {
-            if (profile->cccd_handle == 0) {
+            /* First CCCD after the notify char belongs to 0xFFF4; the one that
+             * follows the write char belongs to 0xFFF5. Keep both. */
+            if (dsc->handle > profile->write_char_handle) {
+                if (profile->cccd_handle_write == 0) {
+                    profile->cccd_handle_write = dsc->handle;
+                    ESP_LOGI(TAG, "Camera %d: CCCD (0xFFF5) found, handle=0x%x",
+                             camera_index, dsc->handle);
+                }
+            } else if (profile->cccd_handle == 0) {
                 profile->cccd_handle = dsc->handle;
-                ESP_LOGI(TAG, "Camera %d: CCCD found, handle=0x%x",
+                ESP_LOGI(TAG, "Camera %d: CCCD (0xFFF4) found, handle=0x%x",
                          camera_index, dsc->handle);
             }
         }
     } else if (error->status == BLE_HS_EDONE) {
         s_active_scan_camera_index = -1;
-        ESP_LOGI(TAG, "Camera %d: GATT discovery complete (cccd=0x%04x notify=0x%04x write=0x%04x)",
-                 camera_index, profile->cccd_handle,
+        ESP_LOGI(TAG, "Camera %d: GATT discovery complete (cccd4=0x%04x cccd5=0x%04x notify=0x%04x write=0x%04x)",
+                 camera_index, profile->cccd_handle, profile->cccd_handle_write,
                  profile->notify_char_handle, profile->write_char_handle);
     }
     return 0;
@@ -409,13 +560,22 @@ static int on_write_complete(uint16_t conn_handle,
                              struct ble_gatt_attr *attr, void *arg)
 {
     if (error->status != 0) {
-        ESP_LOGE(TAG, "Write failed, conn_handle=%d attr_handle=0x%x status=%d",
-                 conn_handle, attr ? attr->handle : 0, error->status);
-        ble_profile_t *profile = get_profile_by_conn_id(conn_handle);
-        if (profile) {
-            profile->connection_status.is_connected = false;
-            ESP_LOGW(TAG, "Camera %d: Marking as disconnected due to write failure",
-                     profile->camera_index);
+        /* status >= 0x100 encodes an ATT error: att_err = status - 0x100
+         * (BLE_HS_ATT_ERR). 0x05 = INSUFFICIENT_AUTHEN, 0x0F = INSUFFICIENT_ENC. */
+        ESP_LOGE(TAG, "Write failed, conn_handle=%d attr_handle=0x%x status=%d%s",
+                 conn_handle, attr ? attr->handle : 0, error->status,
+                 (error->status >= 0x100) ? " (ATT error)" : "");
+        /* Only a genuine link loss means "disconnected". Treating any ATT
+         * error (e.g. a transient or permission error) as a disconnect used to
+         * poison every later write and self-inflict a silence-induced drop. */
+        if (error->status == BLE_HS_ENOTCONN || error->status == BLE_HS_EDISABLED ||
+            error->status == BLE_HS_ETIMEOUT) {
+            ble_profile_t *profile = get_profile_by_conn_id(conn_handle);
+            if (profile) {
+                profile->connection_status.is_connected = false;
+                ESP_LOGW(TAG, "Camera %d: Marking as disconnected due to link loss",
+                         profile->camera_index);
+            }
         }
     } else {
         ESP_LOGI(TAG, "Write complete, conn_handle=%d attr_handle=0x%x",
@@ -438,17 +598,18 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
         const uint8_t *adv = event->disc.data;
         uint8_t adv_len    = event->disc.length_data;
 
+        uint8_t bda_be[6];
+        bda_reverse(event->disc.addr.val, bda_be);
+
         /* Pure scan responses (name only, no manufacturer data) can update
          * the displayed name of an already-discovered camera during pairing.
          * Note: some controllers combine ADV_IND + SCAN_RSP into a single
          * report, so we must NOT break here — always fall through to the
          * is_dji_camera_adv() check which handles combined reports. */
-        if (!is_dji_camera_adv(adv, adv_len)) {
+        if (!is_dji_camera_adv(adv, adv_len, bda_be)) {
             if (s_scan_controller.mode == SCAN_MODE_PAIRING) {
                 const char *rsp_name = extract_device_name(adv, adv_len);
                 if (strcmp(rsp_name, "DJI Camera") != 0) {
-                    uint8_t bda_be[6];
-                    bda_reverse(event->disc.addr.val, bda_be);
                     extern void ui_pairing_update_discovered_camera_name(
                             const char *name, const uint8_t *mac);
                     ui_pairing_update_discovered_camera_name(rsp_name, bda_be);
@@ -460,9 +621,6 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
         const char *adv_name_str = extract_device_name(adv, adv_len);
         uint32_t device_id       = get_dji_device_id(adv, adv_len);
         int8_t rssi              = event->disc.rssi;
-
-        uint8_t bda_be[6];
-        bda_reverse(event->disc.addr.val, bda_be);
 
         ESP_LOGI(TAG, "Found device: %s RSSI=%d MAC=%02X:%02X:%02X:%02X:%02X:%02X "
                  "device_id=0x%04X mode=%d",
@@ -638,6 +796,21 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
                  peer_bda_be[0], peer_bda_be[1], peer_bda_be[2],
                  peer_bda_be[3], peer_bda_be[4], peer_bda_be[5]);
 
+        /*
+         * Security is initiated in on_mtu_exchanged(), NOT here.
+         *
+         * The link MUST be encrypted for the camera to act on our writes —
+         * hardware-proven on the Osmo Nano: with encryption the camera
+         * answered 0x07/0x45 and the link lived 22+ s; without it, it ignored
+         * every request and died in ~600 ms.
+         *
+         * But calling ble_gap_security_initiate() straight from the connect
+         * event stalls the ATT bearer on a camera that does NOT answer SMP
+         * (the Xtra Edge Pro): NimBLE queues the MTU exchange behind the
+         * pending pairing and nothing completes for 20 s. Doing it after the
+         * MTU exchange matches the order the Nano actually performed
+         * (MTU -> encryption -> discovery) and keeps a silent peer harmless.
+         */
         ble_gattc_exchange_mtu(event->connect.conn_handle,
                                 on_mtu_exchanged,
                                 (void *)(intptr_t)slot);
@@ -658,8 +831,11 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
             profile->notify_char_handle = 0;
             profile->write_char_handle = 0;
             profile->cccd_handle = 0;
-            ESP_LOGI(TAG, "Camera %d disconnected, reason=0x%x",
-                     camera_idx, event->disconnect.reason);
+            profile->cccd_handle_write = 0;
+            int64_t silent_ms = s_last_rx_us ?
+                    (esp_timer_get_time() - s_last_rx_us) / 1000 : -1;
+            ESP_LOGI(TAG, "Camera %d disconnected, reason=0x%x (peer silent for %lld ms)",
+                     camera_idx, event->disconnect.reason, silent_ms);
 
             if (s_active_scan_camera_index == camera_idx) {
                 s_active_scan_camera_index = -1;
@@ -670,8 +846,12 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
         }
 
         s_connecting = false;
-        if (s_state_cb) {
-            s_state_cb();
+        /* Hand off to link_evt_task — must NOT block the NimBLE host task here. */
+        if (s_link_evt_queue) {
+            link_evt_t evt = { .type = LINK_EVT_DISCONNECTED };
+            if (xQueueSend(s_link_evt_queue, &evt, 0) != pdTRUE) {
+                ESP_LOGW(TAG, "Link event queue full, dropping disconnect event");
+            }
         }
         break;
     }
@@ -681,6 +861,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
         uint16_t conn_handle = event->notify_rx.conn_handle;
         uint16_t attr_handle = event->notify_rx.attr_handle;
         uint16_t data_len = OS_MBUF_PKTLEN(event->notify_rx.om);
+        s_last_rx_us = esp_timer_get_time();
         ESP_LOGI(TAG, "NOTIFY_RX: conn_handle=%d attr_handle=0x%x len=%d ind=%d",
                  conn_handle, attr_handle, data_len, event->notify_rx.indication);
 
@@ -726,16 +907,41 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
         break;
 
     /* ---------- Connection parameters updated ---------- */
-    case BLE_GAP_EVENT_CONN_UPDATE:
-        ESP_LOGD(TAG, "Connection parameters updated: conn_handle=%d status=%d",
-                 event->conn_update.conn_handle, event->conn_update.status);
+    case BLE_GAP_EVENT_CONN_UPDATE: {
+        struct ble_gap_conn_desc d;
+        if (ble_gap_conn_find(event->conn_update.conn_handle, &d) == 0) {
+            ESP_LOGI(TAG, "Conn params applied: itvl=%d latency=%d supervision=%d (%d ms) status=%d",
+                     d.conn_itvl, d.conn_latency, d.supervision_timeout,
+                     d.supervision_timeout * 10, event->conn_update.status);
+        }
         break;
+    }
 
     /* ---------- Encryption change ---------- */
-    case BLE_GAP_EVENT_ENC_CHANGE:
-        ESP_LOGI(TAG, "Encryption change: conn_handle=%d status=%d",
-                 event->enc_change.conn_handle, event->enc_change.status);
+    case BLE_GAP_EVENT_ENC_CHANGE: {
+        struct ble_gap_conn_desc ed;
+        int erc = ble_gap_conn_find(event->enc_change.conn_handle, &ed);
+        /* Informational only — encryption is NOT required. Cameras accept
+         * commands on a fully unencrypted link (retested with all bonds wiped:
+         * encrypted=0 bonded=0, SMP never ran, record still worked). */
+        ESP_LOGI(TAG, "ENC CHANGE: status=%d encrypted=%d authenticated=%d bonded=%d",
+                 event->enc_change.status,
+                 erc == 0 ? ed.sec_state.encrypted : -1,
+                 erc == 0 ? ed.sec_state.authenticated : -1,
+                 erc == 0 ? ed.sec_state.bonded : -1);
         break;
+    }
+
+    case BLE_GAP_EVENT_REPEAT_PAIRING: {
+        /* Bond already exists but the peer re-pairs: drop the stale bond and
+         * accept, otherwise reconnects to a previously-bonded camera fail. */
+        struct ble_gap_conn_desc rd;
+        if (ble_gap_conn_find(event->repeat_pairing.conn_handle, &rd) == 0) {
+            ble_store_util_delete_peer(&rd.peer_id_addr);
+        }
+        ESP_LOGW(TAG, "Repeat pairing: deleted old bond, retrying");
+        return BLE_GAP_REPEAT_PAIRING_RETRY;
+    }
 
     /* ---------- L2CAP connection parameter update request from peripheral ---------- */
     case BLE_GAP_EVENT_L2CAP_UPDATE_REQ:
@@ -746,7 +952,26 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
                  event->conn_update_req.peer_params->itvl_max,
                  event->conn_update_req.peer_params->latency,
                  event->conn_update_req.peer_params->supervision_timeout);
-        return 0;  /* Return 0 to accept the update request */
+        /*
+         * Raise the peer's supervision timeout to our floor. The camera asks
+         * for 2.0 s (Nano) / 5.0 s (Xtra); Android negotiates far longer, so a
+         * camera that merely goes QUIET for a few seconds — e.g. while
+         * re-tuning its radio — is fatal for us but survivable for Mimo.
+         * Accepting the peer's interval/latency but extending the timeout is
+         * legal and only makes us more patient.
+         */
+        /* NOTE: self_params can be NULL here (it is for an L2CAP-initiated
+         * update in this NimBLE version) — writing to it panics. Only adjust
+         * in place when the stack actually gave us a buffer; otherwise accept
+         * and raise the timeout afterwards with our own update request. */
+        if (event->conn_update_req.self_params != NULL &&
+            event->conn_update_req.peer_params->supervision_timeout < BLE_SUPERVISION_TIMEOUT_FLOOR) {
+            ESP_LOGI(TAG, "Raising supervision timeout %d -> %d (%d ms)",
+                     event->conn_update_req.peer_params->supervision_timeout,
+                     BLE_SUPERVISION_TIMEOUT_FLOOR, BLE_SUPERVISION_TIMEOUT_FLOOR * 10);
+            event->conn_update_req.self_params->supervision_timeout = BLE_SUPERVISION_TIMEOUT_FLOOR;
+        }
+        return 0;  /* Return 0 to accept */
 
     default:
         ESP_LOGW(TAG, "Unhandled GAP event: type=%d", event->type);
@@ -782,14 +1007,25 @@ esp_err_t ble_init(void) {
 
     /* Disable security to match the original Bluedroid config which had no
        SMP/encryption.  DJI cameras operate without BLE-level encryption. */
-    ble_hs_cfg.sm_io_cap         = BLE_SM_IO_CAP_NO_IO;
-    ble_hs_cfg.sm_bonding        = 0;
+    /*
+     * Security manager ENABLED (Just Works, no MITM, bonding on).
+     *
+     * The camera ATT-acks our writes but never acts on them. A BLE peripheral
+     * that requires an encrypted link behaves exactly like this, and Android
+     * negotiates encryption transparently when a peer asks for it — with SM
+     * compiled out we could not even answer a security request. Bonds persist
+     * because CONFIG_BT_NIMBLE_NVS_PERSIST=y.
+     */
+    ble_hs_cfg.sm_io_cap         = BLE_SM_IO_CAP_NO_IO;   /* Just Works */
+    ble_hs_cfg.sm_bonding        = 1;
     ble_hs_cfg.sm_mitm           = 0;
-    ble_hs_cfg.sm_sc             = 0;
-    ble_hs_cfg.sm_our_key_dist   = 0;
-    ble_hs_cfg.sm_their_key_dist = 0;
+    ble_hs_cfg.sm_sc             = 1;                     /* LE Secure Connections */
+    ble_hs_cfg.sm_our_key_dist   = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+    ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
 
-    ble_att_set_preferred_mtu(500);
+    ble_att_set_preferred_mtu(500);   /* NOT 517: the sdkconfig NimBLE buffers are sized for 500, and
+                                      * negotiating 517 made the camera stop answering EVERY request
+                                      * (MTU 500 answers pairing, 517 answers nothing - 4 runs). */
 
     /* Initialize mandatory BLE services before starting the host.
        ble_svc_gap_init()  registers GAP service (0x1800) with Device Name + Appearance.
@@ -801,6 +1037,19 @@ esp_err_t ble_init(void) {
     ble_svc_gap_device_name_set("DJI-Remote");
 
     ble_gap_event_listener_register(&s_global_listener, global_event_listener, NULL);
+
+    /* Link-event dispatch task — keeps the blocking disconnect/reconnect logic
+     * off the NimBLE host task (see link_evt_task). Created before the host
+     * starts so no disconnect can arrive with a NULL queue. */
+    s_link_evt_queue = xQueueCreate(4, sizeof(link_evt_t));
+    if (s_link_evt_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create link event queue");
+        return ESP_ERR_NO_MEM;
+    }
+    if (xTaskCreate(link_evt_task, "ble_link_evt", 6144, NULL, 4, &s_link_evt_task) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create link event task");
+        return ESP_ERR_NO_MEM;
+    }
 
     s_ble_sync_sem = xSemaphoreCreateBinary();
     nimble_port_freertos_init(nimble_host_task);
@@ -978,7 +1227,7 @@ static void try_to_connect(int camera_index, const uint8_t *addr) {
     bda_reverse(addr, peer_addr.val);
 
     int rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, &peer_addr, 30000,
-                              NULL, gap_event_cb, NULL);
+                              &s_conn_params, gap_event_cb, NULL);
     if (rc != 0) {
         ESP_LOGE(TAG, "Camera %d: ble_gap_connect failed: %d", camera_index, rc);
         s_connecting = false;
@@ -1077,7 +1326,7 @@ esp_err_t ble_connect_direct(int camera_index) {
     bda_reverse(p->target_mac, peer_addr.val);
 
     int rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, &peer_addr, 30000,
-                              NULL, gap_event_cb, NULL);
+                              &s_conn_params, gap_event_cb, NULL);
     if (rc != 0) {
         ESP_LOGE(TAG, "ble_connect_direct: ble_gap_connect failed for camera %d: %d",
                  camera_index, rc);
@@ -1141,6 +1390,17 @@ esp_err_t ble_write_without_response(uint16_t conn_id, uint16_t handle,
         return ESP_FAIL;
     }
 
+    /* ATT handle 0x0000 is reserved/illegal. Writing to it is a protocol
+     * violation that wedges the peer's ATT bearer — the camera then stops
+     * answering and the link dies at the supervision timeout. This happens
+     * whenever something writes before GATT discovery has resolved the
+     * characteristic handles. */
+    if (handle == 0) {
+        ESP_LOGE(TAG, "Camera %d: refusing write to ATT handle 0 (discovery incomplete)",
+                 p->camera_index);
+        return ESP_ERR_INVALID_STATE;
+    }
+
     int rc = ble_gattc_write_no_rsp_flat(conn_id, handle, data, (uint16_t)length);
     if (rc != 0) {
         ESP_LOGE(TAG, "Camera %d: write_no_rsp failed: %d", p->camera_index, rc);
@@ -1161,6 +1421,12 @@ esp_err_t ble_write_with_response(uint16_t conn_id, uint16_t handle,
     if (!p || !p->connection_status.is_connected) {
         ESP_LOGW(TAG, "Not connected or invalid conn_id, skip write_with_response");
         return ESP_FAIL;
+    }
+
+    if (handle == 0) {
+        ESP_LOGE(TAG, "Camera %d: refusing write to ATT handle 0 (discovery incomplete)",
+                 p->camera_index);
+        return ESP_ERR_INVALID_STATE;
     }
 
     ESP_LOGI(TAG, "Camera %d: write_rsp conn=%d handle=0x%x len=%d",
@@ -1194,7 +1460,7 @@ esp_err_t ble_register_notify(uint16_t conn_id, uint16_t char_handle) {
     }
 
     uint8_t enable[] = {0x01, 0x00};
-    ESP_LOGI(TAG, "Camera %d: Writing CCCD 0x%04x → [%02x %02x] (enable notify)",
+    ESP_LOGI(TAG, "Camera %d: Writing CCCD 0x%04x (0xFFF4) -> [%02x %02x]",
              p->camera_index, p->cccd_handle, enable[0], enable[1]);
     int rc = ble_gattc_write_flat(conn_id, p->cccd_handle,
                                    enable, sizeof(enable),
@@ -1205,8 +1471,66 @@ esp_err_t ble_register_notify(uint16_t conn_id, uint16_t char_handle) {
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "Camera %d: Notifications enabled (CCCD handle=0x%x)",
-             p->camera_index, p->cccd_handle);
+    /* The camera expects the client subscribed to 0xFFF5's CCCD as well —
+     * the verified Osmosis app enables notify on BOTH characteristics before
+     * writing a single DUML byte. Sequenced after the first CCCD write. */
+    if (p->cccd_handle_write != 0) {
+        vTaskDelay(pdMS_TO_TICKS(150));
+        ESP_LOGI(TAG, "Camera %d: Writing CCCD 0x%04x (0xFFF5) -> [%02x %02x]",
+                 p->camera_index, p->cccd_handle_write, enable[0], enable[1]);
+        rc = ble_gattc_write_flat(conn_id, p->cccd_handle_write,
+                                   enable, sizeof(enable),
+                                   on_write_complete, NULL);
+        if (rc != 0) {
+            ESP_LOGW(TAG, "Camera %d: 0xFFF5 CCCD write failed: %d", p->camera_index, rc);
+        }
+    } else {
+        ESP_LOGW(TAG, "Camera %d: no CCCD found for 0xFFF5", p->camera_index);
+    }
+
+    /*
+     * "Arm" write: [0x01 0x00] to the 0xFFF4 characteristic VALUE (not its
+     * CCCD), with response, after the CCCDs and before any 0xFFF5 traffic.
+     * Osmosis/lib-osmo-ble do this on every connection; skipping it is the
+     * prime suspect for the camera wedging on our first 0xFFF5 write.
+     */
+    vTaskDelay(pdMS_TO_TICKS(150));
+    ESP_LOGI(TAG, "Camera %d: Arming 0xFFF4 (handle 0x%04x) -> [01 00]",
+             p->camera_index, p->notify_char_handle);
+    rc = ble_gattc_write_flat(conn_id, p->notify_char_handle,
+                               enable, sizeof(enable),
+                               on_write_complete, NULL);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "Camera %d: arm write to 0xFFF4 failed: %d", p->camera_index, rc);
+    }
+    vTaskDelay(pdMS_TO_TICKS(200));   /* lib-osmo-ble: wait 200 ms before first DUML */
+
+    /* Raise the supervision timeout with our own central-initiated update.
+     * The camera negotiates 2-5 s; Android runs far longer, so a camera that
+     * merely goes quiet for a few seconds is fatal for us and survivable for
+     * Mimo. Done here (post-discovery, off the GAP callback) because the
+     * L2CAP update request gives us no writable self_params. */
+    struct ble_gap_conn_desc cur;
+    if (ble_gap_conn_find(conn_id, &cur) == 0 &&
+        cur.supervision_timeout < BLE_SUPERVISION_TIMEOUT_FLOOR) {
+        /* Keep the interval/latency the camera asked for — only stretch the
+         * timeout. Renegotiating the interval as well degrades its status
+         * stream for no benefit. */
+        struct ble_gap_upd_params upd = {
+            .itvl_min = cur.conn_itvl,
+            .itvl_max = cur.conn_itvl,
+            .latency = cur.conn_latency,
+            .supervision_timeout = BLE_SUPERVISION_TIMEOUT_FLOOR,
+            .min_ce_len = 0,
+            .max_ce_len = 0,
+        };
+        int urc = ble_gap_update_params(conn_id, &upd);
+        ESP_LOGI(TAG, "Camera %d: keeping itvl=%d, raising supervision %d -> %d ms (rc=%d)",
+                 p->camera_index, cur.conn_itvl, cur.supervision_timeout * 10,
+                 BLE_SUPERVISION_TIMEOUT_FLOOR * 10, urc);
+    }
+
+    ESP_LOGI(TAG, "Camera %d: Notifications enabled + armed", p->camera_index);
     return ESP_OK;
 }
 

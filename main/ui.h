@@ -98,6 +98,10 @@ typedef struct camera_state_s {
 
     // Camera status fields
     uint8_t camera_mode;
+    /* Osmo shooting mode (osmo_mode_t), read from the 0x02/0x80 push @57.
+     * Sparse enum — Video 0x01, Photo 0x05, SlowMo 0x00 … see osmo_duml.h.
+     * Distinct from camera_mode above, which is the legacy R-SDK enum. */
+    uint8_t shoot_mode;
     uint8_t camera_status;
     uint8_t video_resolution;
     uint8_t fps_idx;

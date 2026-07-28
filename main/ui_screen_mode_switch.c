@@ -12,6 +12,7 @@
 #include "lvgl_icons.h"
 #include "command_logic.h"
 #include "enums_logic.h"
+#include "osmo_duml.h"
 #include "esp_log.h"
 #include <string.h>
 #include <stdio.h>
@@ -178,7 +179,9 @@ void ui_screen_mode_switch_update(void) {
 
     const camera_state_t *cam = &g_camera_states[s_camera_index];
 
-    const lv_image_dsc_t *mode_ico = (cam->camera_mode == 0x05)
+    /* shoot_mode comes from the camera's own status push, so it is right even
+     * when the mode was changed on the camera rather than from here. */
+    const lv_image_dsc_t *mode_ico = (cam->shoot_mode == OSMO_MODE_PHOTO)
                                          ? &lvgl_photo_icon
                                          : &lvgl_video_icon;
     lv_image_set_src(s_mode_icon, mode_ico);
@@ -188,10 +191,16 @@ void ui_screen_mode_switch_update(void) {
         lv_label_set_text_fmt(s_mode_text, "%s\n%s",
                               cam->mode_name, cam->mode_param);
     } else {
-        const char *res = short_resolution(cam->video_resolution);
-        const char *fps = fps_idx_to_string((fps_idx_t)cam->fps_idx);
-        const char *eis = eis_mode_to_string((eis_mode_t)cam->eis_mode);
-        lv_label_set_text_fmt(s_mode_text, "%s\n%s %s", res, fps, eis);
+        /* Name the mode, then the detail line. Photo has no video resolution or
+         * fps to show, so don't render placeholders for them. */
+        const char *name = osmo_mode_name(cam->shoot_mode);
+        if (cam->shoot_mode == OSMO_MODE_PHOTO) {
+            lv_label_set_text_fmt(s_mode_text, "%s", name);
+        } else {
+            const char *res = short_resolution(cam->video_resolution);
+            const char *fps = fps_idx_to_string((fps_idx_t)cam->fps_idx);
+            lv_label_set_text_fmt(s_mode_text, "%s\n%s %s", name, res, fps);
+        }
     }
 }
 

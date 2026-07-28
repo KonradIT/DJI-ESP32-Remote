@@ -130,6 +130,15 @@ static void get_status_icon_and_color(int idx, const camera_state_t *st,
  * Resolution / FPS Helpers (mirrors logic in ui.c)
  * ====================================================================== */
 
+/* Last 4 characters of the advertised name, or the whole thing if shorter. */
+static const char *short_camera_name(const char *name) {
+    if (name == NULL) {
+        return "";
+    }
+    size_t n = strlen(name);
+    return (n > 4) ? name + (n - 4) : name;
+}
+
 static const char *short_resolution(uint8_t res) {
     switch (res) {
         case 10:  return "1080P";
@@ -362,7 +371,10 @@ static void update_camera_block(int idx) {
     camera_connection_state_t conn = st->connection_state;
     bool sleeping   = st->is_sleeping;
     bool recording  = st->is_recording;
-    uint8_t cam_mode = st->camera_mode;
+    /* shoot_mode is the live value from the camera's status push; camera_mode
+     * is the legacy R-SDK field and is never populated by the DUML port, so
+     * using it left the main screen stuck showing Video forever. */
+    uint8_t cam_mode = st->shoot_mode;
 
     /* Selection indicator */
     bool selected;
@@ -397,7 +409,10 @@ static void update_camera_block(int idx) {
 
     if (!show_title) return;
 
-    lv_label_set_text(cb->title, st->model_name);
+    /* DJI advertises "OsmoNano-C2D8" / "XtraEdgePro-2DCA16"; only the trailing
+     * chars distinguish two cameras, and the title strip has no room for the
+     * model prefix. Show the last 4. */
+    lv_label_set_text(cb->title, short_camera_name(st->model_name));
 
     if (!show_full) return;
 

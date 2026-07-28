@@ -7,3 +7,9 @@
 sdkconfig.old
 /release
 /.cache
+# PlatformIO
+/.pio
+sdkconfig.m5stack-basic-v27
+sdkconfig.waveshare-s3-lcd19
+/build_fast
+tools/re
