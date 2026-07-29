@@ -18,6 +18,29 @@ const char *osmo_mode_name(uint8_t mode)
     }
 }
 
+/*
+ * NULL rather than "?" for an unobserved code: the caller then omits the field
+ * instead of printing a placeholder next to a real value, which would read as
+ * though we knew the setting and it was unset.
+ */
+const char *osmo_photo_size_name(uint8_t size)
+{
+    switch (size) {
+        case OSMO_PHOTO_SIZE_M: return "M";
+        case OSMO_PHOTO_SIZE_L: return "L";
+        default:                return NULL;
+    }
+}
+
+const char *osmo_photo_aspect_name(uint8_t aspect)
+{
+    switch (aspect) {
+        case OSMO_PHOTO_ASPECT_4_3:  return "4:3";
+        case OSMO_PHOTO_ASPECT_16_9: return "16:9";
+        default:                     return NULL;
+    }
+}
+
 const uint8_t OSMO_SESSION_OPEN[2]      = { 0x04, 0x00 };
 const uint8_t OSMO_SESSION_KEEPALIVE[2] = { 0x01, 0x01 };
 const uint8_t OSMO_PARAM_GET_0014[4] = { 0x00, 0x01, 0x14, 0x00 };
@@ -74,6 +97,12 @@ const char *const OSMO_CFG_NAMES[] = {
     "camcap_color_mode",
     "camcap_wb",
     "cam_custom_mode_params",
+    /* Photo-mode counterparts of cam_video_param_v2 / camcap_video_format.
+     * Subscribed but not yet decoded — while the camera is in photo mode the
+     * video names keep reporting the VIDEO setting, so these are the only
+     * source for the photo resolution the UI should be showing. */
+    "cam_photo_param_new",
+    "camcap_photo_size",
 };
 const size_t OSMO_CFG_NAMES_COUNT =
     sizeof(OSMO_CFG_NAMES) / sizeof(OSMO_CFG_NAMES[0]);

@@ -22,9 +22,9 @@ All notable changes to this project are documented in this file.
   - Status ingestion rewritten for the Nano pushes (`0x02/0x80` recording +
     storage, `0x02/0xA0` record time, `0x02/0xDC` storage, `0x0D/0x02`
     battery).
-  - BLE scan classification rewritten detect if a scanned hit is a DJI camera  only if it carries the DJI
-    company id (`0x08AA`/`0xF7AA`) or the Xtra OUI `EC:9E:EA`, no longer the R-SDK-only
-    `0xFA` byte.
+  - BLE scan classification rewritten to detect if a scanned hit is a DJI camera
+    only if it carries the DJI company id (`0x08AA`) or a camera keyword in its
+    advertised name, no longer the R-SDK-only `0xFA` byte.
   - Pairing uses this remote's own identifier and the on-screen token `DRMT`
     (not the Osmosis app's shared `osmo` identity).
 - **PlatformIO build support** — `platformio.ini` with per-board environments

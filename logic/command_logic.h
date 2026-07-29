@@ -54,6 +54,9 @@ esp_err_t command_logic_stop_record_async(int camera_index);
 
 esp_err_t command_logic_take_photo(int camera_index);
 
+/* Mode-aware capture: shoots in photo mode, starts recording otherwise. */
+esp_err_t command_logic_shutter_async(int camera_index);
+
 /* Set the shooting mode (osmo_mode_t) via 0x02/0xE1. The camera echoes it back
  * in its status push, so g_camera_states[].shoot_mode follows automatically. */
 esp_err_t command_logic_set_shoot_mode(int camera_index, uint8_t mode);

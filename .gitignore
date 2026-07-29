@@ -13,3 +13,6 @@ sdkconfig.m5stack-basic-v27
 sdkconfig.waveshare-s3-lcd19
 /build_fast
 tools/re
+# Python bytecode from tools/re/ scripts
+__pycache__/
+*.pyc

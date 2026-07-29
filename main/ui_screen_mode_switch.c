@@ -47,13 +47,14 @@ static btn_widget_t s_btn_b;
 
 static const char *short_resolution(uint8_t res) {
     switch (res) {
-        case 10:  return "1080P";
-        case 16:  return "4K 16:9";
-        case 45:  return "2.7K 16:9";
+        case 10:  return "1080P";       /* 1920x1080 */
+        case 12:  return "1080P 4:3";   /* 1920x1440 */
+        case 16:  return "4K 16:9";     /* 3840x2160 */
+        case 45:  return "2.7K 16:9";   /* 2688x1512 */
         case 66:  return "1080P 9:16";
         case 67:  return "2.7K 9:16";
-        case 95:  return "2.7K 4:3";
-        case 103: return "4K 4:3";
+        case 95:  return "2.7K 4:3";    /* 2688x2016 */
+        case 103: return "4K 4:3";      /* 3840x2880 */
         case 109: return "4K 9:16";
         default:  return "-";
     }
@@ -195,7 +196,17 @@ void ui_screen_mode_switch_update(void) {
          * fps to show, so don't render placeholders for them. */
         const char *name = osmo_mode_name(cam->shoot_mode);
         if (cam->shoot_mode == OSMO_MODE_PHOTO) {
-            lv_label_set_text_fmt(s_mode_text, "%s", name);
+            /* Photo has no video resolution/fps; show its own size + aspect
+             * from cam_photo_param_new, omitting either if unmapped. */
+            const char *size   = osmo_photo_size_name(cam->photo_size);
+            const char *aspect = osmo_photo_aspect_name(cam->photo_aspect);
+            if (size && aspect) {
+                lv_label_set_text_fmt(s_mode_text, "%s\n%s %s", name, size, aspect);
+            } else if (aspect) {
+                lv_label_set_text_fmt(s_mode_text, "%s\n%s", name, aspect);
+            } else {
+                lv_label_set_text_fmt(s_mode_text, "%s", name);
+            }
         } else {
             const char *res = short_resolution(cam->video_resolution);
             const char *fps = fps_idx_to_string((fps_idx_t)cam->fps_idx);

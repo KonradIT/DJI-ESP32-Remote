@@ -2428,9 +2428,10 @@ void ui_screen_main(void) {
                 bool is_sleeping = (cam_state->power_mode == 3) || cam_state->is_sleeping;
                 
                 if (!is_sleeping) {
-                    // Camera is awake - send normal start recording command
-                    ESP_LOGI(TAG, "Sending start command to camera %d (non-blocking)", i);
-                    command_logic_start_record_async(i);
+                    /* Awake — capture. In photo mode this shoots (0x02/0x01),
+                     * in every other mode it starts a recording (0x02/0x02). */
+                    ESP_LOGI(TAG, "Sending capture command to camera %d (non-blocking)", i);
+                    command_logic_shutter_async(i);
                     cameras_started++;
                 }
             }
@@ -2581,19 +2582,19 @@ void ui_screen_main(void) {
         ui_show_shutter_bottom_message("Status Unknown\nTrying...", M5_COLOR_ORANGE, 1000);
     }
     
-    /* Determine shutter behavior based on current camera mode */
-    camera_mode_t current_mode = (camera_mode_t)cam_state->camera_mode;
-    
-    ESP_LOGI(TAG, "Current camera mode: %d, status: %d, recording: %s", 
-             current_mode, cam_state->camera_status, cam_state->is_recording ? "yes" : "no");
-    
-    if (current_mode == CAMERA_MODE_PHOTO) {
-        /* Photo mode - single shot capture */
+    /* Shutter behaviour follows the mode the CAMERA reports (status offset 57),
+     * not the legacy camera_mode field, which nothing populates on this body. */
+    ESP_LOGI(TAG, "Camera %d: shoot_mode=%s status=%d recording=%s", cam_idx,
+             osmo_mode_name(cam_state->shoot_mode), cam_state->camera_status,
+             cam_state->is_recording ? "yes" : "no");
+
+    if (cam_state->shoot_mode == OSMO_MODE_PHOTO) {
+        /* Photo mode — shutter (0x02/0x01 [01]). Fire-and-forget: the camera
+         * completes a burst or interval sequence on its own, so there is no
+         * stop and no recording state to toggle. */
         ESP_LOGI(TAG, "Taking photo in photo mode");
-        record_control_response_frame_t* response = command_logic_start_record(cam_idx);
-        if (response) {
+        if (command_logic_take_photo(cam_idx) == ESP_OK) {
             ui_show_shutter_bottom_message("Photo Taken", M5_COLOR_GREEN, 1000);
-            free(response);
         } else {
             ui_show_shutter_bottom_message("Photo Failed", M5_COLOR_RED, 1500);
         }

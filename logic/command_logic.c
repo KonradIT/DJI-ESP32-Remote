@@ -300,14 +300,43 @@ record_control_response_frame_t* command_logic_stop_record(int camera_index) {
     return (record_control_response_frame_t *)alloc_ret_ok(sizeof(record_control_response_frame_t));
 }
 
-/**
- * @brief Take a photo (0x02/0x01) — used when the camera is in a photo mode
+/*
+ * SHUTTER — 0x02/0x01 with a 1-byte payload [01].
+ *
+ * The 01 is a generic "shoot" trigger, not a photo type: in a Mimo datalink
+ * capture a single shot and a burst both used [01], and the camera applied
+ * whichever photo mode it was already set to.  Fire-and-forget — the camera
+ * finishes a burst or interval sequence on its own, so there is no stop.
+ *
+ * Two earlier failures here were both self-inflicted, and the reply byte said
+ * so each time:
+ *   - an EMPTY payload answers e3 (parameter bad/missing) — the [01] is required
+ *   - [01] while the camera is in a VIDEO mode answers d9 (wrong state)
+ * d9 was never "unsupported" (that is e0); the camera has to be in the photo
+ * shooting mode first, via 0x02/0xE1 [05].
  */
 esp_err_t command_logic_take_photo(int camera_index) {
-    ESP_LOGI(TAG, "Camera %d: take photo (0x02/0x01)", camera_index);
+    const uint8_t payload[1] = { 0x01 };
+    ESP_LOGI(TAG, "Camera %d: shutter (0x02/0x01 [01])", camera_index);
     return osmo_send(camera_index, DUML_ADDR_CAMERA,
                      OSMO_CMDSET_CAMERA, OSMO_CMDID_TAKE_PHOTO,
-                     OSMO_FLAGS_REQUEST, NULL, 0);
+                     OSMO_FLAGS_REQUEST, payload, sizeof(payload));
+}
+
+/*
+ * The big button means "capture" — which command that is depends on the mode
+ * the camera reports at status offset 57.  Photo shoots; every other mode
+ * (video, timelapse, hyperlapse, supernight, slowmo) records.
+ */
+esp_err_t command_logic_shutter_async(int camera_index) {
+    if (camera_index < 0 || camera_index >= NUM_CAMERAS) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    extern camera_state_t g_camera_states[NUM_CAMERAS];
+    if (g_camera_states[camera_index].shoot_mode == OSMO_MODE_PHOTO) {
+        return command_logic_take_photo(camera_index);
+    }
+    return send_record_mode(camera_index, OSMO_RECORD_MODE_START);
 }
 
 /**

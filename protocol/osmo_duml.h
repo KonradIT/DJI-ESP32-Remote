@@ -36,7 +36,7 @@ extern "C" {
  * pressure. Build with -DDEBUG_DUML_PACKETS=1 to turn it on; the RE tooling in
  * tools/re/ parses exactly these lines, so it is required for protocol work
  * (parameter sweeps, A-B-A diffs, decoding an unmapped setting, or bringing up
- * a new camera body such as the Xtra Edge Pro).
+ * a new camera body).
  */
 #ifndef DEBUG_DUML_PACKETS
 #define DEBUG_DUML_PACKETS 0
@@ -105,8 +105,8 @@ extern const size_t OSMO_CFG_NAMES_COUNT;
 #define OSMO_CMDID_SET_MODE       0x02   /* payload [mode:u8]             */
 /*
  * Documented record start/stop.  Answer e0 (unsupported) from EVERY receiver
- * (0x01/0x08/0x28/0x48/0x88/0x1C) on Nano + Xtra firmware — they do not exist
- * here.  Kept only so they are not re-derived from the docs as a lead.
+ * tested (0x01/0x08/0x28/0x48/0x88/0x1C) — they do not exist on this firmware.
+ * Kept only so they are not re-derived from the docs as a lead.
  */
 #define OSMO_CMDID_RECORD_START   0x20
 #define OSMO_CMDID_RECORD_STOP    0x21
@@ -178,10 +178,43 @@ typedef enum {
 } osmo_iso_limit_t;
 
 /*
+ * cam_photo_param_new — the photo counterpart of cam_video_param_v2, pushed on
+ * the 0x00/0x99 config channel (24 B).  Two adjacent fields were pinned by
+ * A-B-A on hardware; every other byte held constant across both runs:
+ *
+ *   02 15 00 [size] [aspect] 02 01 01 00 01 00 00 00 00 00 01 00 x8
+ *              ^3      ^4
+ *
+ *   byte 3  L -> M -> L   04 -> 03 -> 04
+ *   byte 4  4:3 -> 16:9 -> 4:3   00 -> 01 -> 00
+ *
+ * The camera labels sizes by letter rather than in megapixels (the pixel count
+ * differs per body), so the UI mirrors those labels.  M and L are the only
+ * sizes a Nano offers — there is no S — so this enum is complete for this body.
+ * byte 1 (0x15) is not the size; it stayed put while the size changed.
+ */
+typedef enum {
+    OSMO_PHOTO_SIZE_M = 0x03,
+    OSMO_PHOTO_SIZE_L = 0x04,
+} osmo_photo_size_t;
+
+typedef enum {
+    OSMO_PHOTO_ASPECT_4_3  = 0x00,
+    OSMO_PHOTO_ASPECT_16_9 = 0x01,
+} osmo_photo_aspect_t;
+
+#define OSMO_PHOTO_PARAM_SIZE_OFF   3
+#define OSMO_PHOTO_PARAM_ASPECT_OFF 4
+
+/* NULL for a code we have not observed — never invent a label for one. */
+const char *osmo_photo_size_name(uint8_t size);
+const char *osmo_photo_aspect_name(uint8_t aspect);
+
+/*
  * 0x02/0x80 status push payload offsets (60 B, active store only).
  *
- * GROUND-TRUTHED on an Xtra Edge Pro by recording with the camera's own button
- * and diffing the payload (idle -> recording):
+ * GROUND-TRUTHED on hardware by recording with the camera's own button and
+ * diffing the payload (idle -> recording):
  *   byte0   0x01 -> 0x81   ... bit7 = RECORDING
  *   @9      59274 -> 58572 ... free MiB falls while recording
  *   @17     7278  -> 7192  ... remaining recordable seconds, counts down

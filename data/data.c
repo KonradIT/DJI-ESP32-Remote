@@ -1002,8 +1002,7 @@ static void auto_ack_request(int camera_index, const duml_frame_t *req) {
  * into the caller's receive buffer). */
 static void handle_duml_frame(int camera_index, duml_frame_t frame) {
     /* cam%d matters: with two cameras connected, an unlabelled RX line cannot
-     * be attributed, which made it impossible to tell which body was answering
-     * (or not answering) during the Xtra investigation. */
+     * be attributed, so a reply from one body reads as a reply from the other. */
 #if DEBUG_DUML_PACKETS
     ESP_LOGI(TAG, "RX cam%d src=0x%02X dst=0x%02X flags=0x%02X cmd=0x%02X/0x%02X seq=0x%04X plen=%u",
              camera_index, frame.src, frame.dst, frame.cmd_type, frame.cmd_set,

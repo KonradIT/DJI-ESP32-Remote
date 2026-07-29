@@ -215,8 +215,14 @@ void update_camera_state_handler(int camera_index, void *data) {
              * from the log without another firmware round-trip. */
 #if DEBUG_DUML_PACKETS
             /* Names + values of every config push — this is how an unmapped
-             * setting (EIS, colour mode, …) gets decoded from a log. */
-            ESP_LOG_BUFFER_HEX_LEVEL(TAG, val, val_len > 24 ? 24 : val_len, ESP_LOG_INFO);
+             * setting (EIS, colour mode, …) gets decoded from a log.
+             *
+             * The cap must exceed the parameter under investigation or the diff
+             * silently reads as "nothing changed": at 24 B this truncated
+             * cam_lens_state (66 B) to its first third, and at 96 B it hid the
+             * tail of cam_custom_mode_params (161 B). 192 covers every name we
+             * subscribe to. tools/re/cfgvals.py must match. */
+            ESP_LOG_BUFFER_HEX_LEVEL(TAG, val, val_len > 192 ? 192 : val_len, ESP_LOG_INFO);
             ESP_LOGI(TAG, "cfg cam%d '%.*s' (%u B)", camera_index, (int)name_len, name, val_len);
 #endif
             /* cam_video_param_v2: [resolution:u8][fps_idx:u8]… — the current
@@ -233,6 +239,23 @@ void update_camera_state_handler(int camera_index, void *data) {
                         current_video_resolution = val[0];
                         current_fps_idx = val[1];
                     }
+                }
+            }
+
+            /* cam_photo_param_new: the photo counterpart — size at byte 3,
+             * aspect ratio at byte 4 (both pinned by A-B-A, see osmo_duml.h).
+             * Needed because cam_video_param_v2 above keeps reporting the
+             * video setting while the camera is in photo mode. */
+            if (name_len == 19 && strncmp(name, "cam_photo_param_new", 19) == 0 &&
+                val_len > OSMO_PHOTO_PARAM_ASPECT_OFF) {
+                uint8_t size   = val[OSMO_PHOTO_PARAM_SIZE_OFF];
+                uint8_t aspect = val[OSMO_PHOTO_PARAM_ASPECT_OFF];
+                if (cam->photo_size != size || cam->photo_aspect != aspect) {
+                    cam->photo_size = size;
+                    cam->photo_aspect = aspect;
+                    changed = true;
+                    ESP_LOGI(TAG, "Camera %d: photo size %u aspect %u",
+                             camera_index, size, aspect);
                 }
             }
         }

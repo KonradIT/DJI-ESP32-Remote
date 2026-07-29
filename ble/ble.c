@@ -81,8 +81,8 @@ static int64_t s_last_rx_us = 0;
 /*
  * Minimum BLE supervision timeout, in 10 ms units (2000 = 20 s).
  *
- * NimBLE's default is ~2.56 s and the camera asks for 2.0 s (Nano) / 5.0 s
- * (Xtra). Mimo on Android runs a much longer timeout, so if the camera simply
+ * NimBLE's default is ~2.56 s and cameras ask for 2.0-5.0 s depending on the
+ * body. Mimo on Android runs a much longer timeout, so if the camera simply
  * stops transmitting for several seconds (e.g. re-tuning its radio) Android
  * rides it out while we drop the link. Being patient costs nothing and tells
  * us whether the camera's silence is transient or terminal.
@@ -123,6 +123,56 @@ static scan_controller_t s_scan_controller = {
 };
 
 static bool s_ble_scan_active = false;
+
+/*
+ * Boot-scan grace window.
+ *
+ * The boot scan used to run its full 30 s timeout whenever ANY paired slot was
+ * missing, and the connect phase only starts once the scan ends — so a camera
+ * that was found at t=2 s sat idle until t=32 s just because a second, powered
+ * off camera was still paired in NVS.  Once the first camera is found the
+ * others are either advertising already or not present at all, so give the
+ * stragglers a short window and then get on with connecting.
+ */
+#define BOOT_SCAN_GRACE_MS 5000
+static esp_timer_handle_t s_boot_scan_grace_timer = NULL;
+
+/*
+ * Must go through ble_stop_scan(), not ble_gap_disc_cancel(): cancelling
+ * discovery produces no BLE_GAP_EVENT_DISC_COMPLETE, so nothing would reset
+ * s_scan_controller.mode — and ble_is_scanning() reports on the mode, so
+ * connect_logic's poll loop would keep waiting out its own 30 s timeout even
+ * though the radio had already stopped.
+ */
+static void boot_scan_grace_cb(void *arg) {
+    (void)arg;
+    if (s_scan_controller.mode == SCAN_MODE_AUTOCONNECT_BOOT && s_ble_scan_active) {
+        ESP_LOGI(TAG, "Boot scan grace window elapsed, connecting with what we found");
+        ble_stop_scan();
+    }
+}
+
+static void boot_scan_grace_arm(void) {
+    if (s_boot_scan_grace_timer == NULL) {
+        const esp_timer_create_args_t args = {
+            .callback = boot_scan_grace_cb,
+            .name = "boot_scan_grace",
+        };
+        if (esp_timer_create(&args, &s_boot_scan_grace_timer) != ESP_OK) {
+            return;   /* fall back to the full scan timeout */
+        }
+    }
+    if (esp_timer_is_active(s_boot_scan_grace_timer)) {
+        return;   /* already counting down from the first find */
+    }
+    esp_timer_start_once(s_boot_scan_grace_timer, (uint64_t)BOOT_SCAN_GRACE_MS * 1000);
+}
+
+static void boot_scan_grace_cancel(void) {
+    if (s_boot_scan_grace_timer != NULL) {
+        esp_timer_stop(s_boot_scan_grace_timer);
+    }
+}
 
 ble_profile_t s_ble_profiles[BLE_MAX_CAMERAS] = {0};
 
@@ -249,14 +299,14 @@ static const uint8_t* find_adv_field(const uint8_t *data, uint8_t data_len,
 }
 
 /*
- * DJI company id, little-endian in the manufacturer AD: 0xAA 0x08 (standard)
- * or 0xAA 0xF7 (Xtra Edge Pro rebrand).  The Osmo Nano advertises
- * `AA 08 | 19 00 00 <6-byte MAC> 03` — model id 0x0019 at mfg[2..3].  The old
- * R-SDK filter also required mfg[4]==0xFA, which the Nano does NOT set, so it
- * was rejected; match on the company id alone and classify by name/model id.
+ * DJI company id, little-endian in the manufacturer AD: 0xAA 0x08.  The Osmo
+ * Nano advertises `AA 08 | 19 00 00 <6-byte MAC> 03` — model id 0x0019 at
+ * mfg[2..3].  The old R-SDK filter also required mfg[4]==0xFA, which the Nano
+ * does NOT set, so it was rejected; match on the company id alone and classify
+ * by name/model id.
  */
 static bool dji_mfg_matches(const uint8_t *mfg, uint8_t mfg_len) {
-    return mfg && mfg_len >= 4 && mfg[0] == 0xAA && (mfg[1] == 0x08 || mfg[1] == 0xF7);
+    return mfg && mfg_len >= 4 && mfg[0] == 0xAA && mfg[1] == 0x08;
 }
 
 /* Case-insensitive "haystack contains needle" (needle must be lowercase). */
@@ -275,21 +325,17 @@ static bool name_has_ci(const char *hay, const char *needle) {
 
 /*
  * Classify a scan result as a DJI Osmo camera. A hit requires ONE of:
- *   1. DJI manufacturer company id 0x08AA / 0xF7AA (little-endian AA 08 / AA F7);
- *   2. the Xtra rebrand OUI EC:9E:EA (bda_be = peer MAC, MSB first, may be NULL);
- *   3. a *real advertised name* containing a camera keyword (the Pocket 3 sends
+ *   1. DJI manufacturer company id 0x08AA (little-endian AA 08);
+ *   2. a *real advertised name* containing a camera keyword (the Pocket 3 sends
  *      no manufacturer data).
  */
 static uint8_t is_dji_camera_adv(const uint8_t *data, uint8_t data_len, const uint8_t *bda_be) {
+    (void)bda_be;
     uint8_t mfg_len = 0;
     const uint8_t *mfg = find_adv_field(data, data_len,
                                          BLE_HS_ADV_TYPE_MFG_DATA, &mfg_len);
     if (dji_mfg_matches(mfg, mfg_len)) {
         return 1;
-    }
-
-    if (bda_be && bda_be[0] == 0xEC && bda_be[1] == 0x9E && bda_be[2] == 0xEA) {
-        return 1;   /* Xtra Edge Pro OUI */
     }
 
     uint8_t name_len = 0;
@@ -306,8 +352,7 @@ static uint8_t is_dji_camera_adv(const uint8_t *data, uint8_t data_len, const ui
         buf[copy_len] = '\0';
         if (name_has_ci(buf, "osmo")   || name_has_ci(buf, "nano")  ||
             name_has_ci(buf, "dji")    || name_has_ci(buf, "pocket") ||
-            name_has_ci(buf, "action") || name_has_ci(buf, "xtra")  ||
-            name_has_ci(buf, "edge")) {
+            name_has_ci(buf, "action")) {
             return 1;
         }
     }
@@ -656,7 +701,14 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
                     }
                     if (all_resolved) {
                         ESP_LOGI(TAG, "All autoconnect slots found, stopping scan early");
+                        boot_scan_grace_cancel();
                         ble_gap_disc_cancel();
+                    } else {
+                        /* Some slot is still outstanding — it may simply be
+                         * switched off, so don't burn the full timeout on it. */
+                        ESP_LOGI(TAG, "Slot %d found, giving remaining slots %d ms",
+                                 i, BOOT_SCAN_GRACE_MS);
+                        boot_scan_grace_arm();
                     }
                     break;
                 }
@@ -687,6 +739,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
     /* ---------- Scan complete ---------- */
     case BLE_GAP_EVENT_DISC_COMPLETE: {
         s_ble_scan_active = false;
+        boot_scan_grace_cancel();
         ESP_LOGI(TAG, "Scan complete (reason=%d, mode=%d)",
                  event->disc_complete.reason, s_scan_controller.mode);
 
@@ -805,9 +858,9 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
          * every request and died in ~600 ms.
          *
          * But calling ble_gap_security_initiate() straight from the connect
-         * event stalls the ATT bearer on a camera that does NOT answer SMP
-         * (the Xtra Edge Pro): NimBLE queues the MTU exchange behind the
-         * pending pairing and nothing completes for 20 s. Doing it after the
+         * event stalls the ATT bearer on a camera that does NOT answer SMP:
+         * NimBLE queues the MTU exchange behind the pending pairing and
+         * nothing completes for 20 s. Doing it after the
          * MTU exchange matches the order the Nano actually performed
          * (MTU -> encryption -> discovery) and keeps a silent peer harmless.
          */
@@ -953,8 +1006,8 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
                  event->conn_update_req.peer_params->latency,
                  event->conn_update_req.peer_params->supervision_timeout);
         /*
-         * Raise the peer's supervision timeout to our floor. The camera asks
-         * for 2.0 s (Nano) / 5.0 s (Xtra); Android negotiates far longer, so a
+         * Raise the peer's supervision timeout to our floor. Cameras ask for
+         * 2.0-5.0 s depending on the body; Android negotiates far longer, so a
          * camera that merely goes QUIET for a few seconds — e.g. while
          * re-tuning its radio — is fatal for us but survivable for Mimo.
          * Accepting the peer's interval/latency but extending the timeout is
@@ -1124,6 +1177,7 @@ esp_err_t ble_stop_scan(void) {
     }
 
     ESP_LOGI(TAG, "Stopping scan (mode was %d)", s_scan_controller.mode);
+    boot_scan_grace_cancel();
     ble_gap_disc_cancel();
     s_ble_scan_active = false;
 

@@ -141,13 +141,14 @@ static const char *short_camera_name(const char *name) {
 
 static const char *short_resolution(uint8_t res) {
     switch (res) {
-        case 10:  return "1080P";
-        case 16:  return "4K 16:9";
-        case 45:  return "2.7K 16:9";
+        case 10:  return "1080P";       /* 1920x1080 */
+        case 12:  return "1080P 4:3";   /* 1920x1440 */
+        case 16:  return "4K 16:9";     /* 3840x2160 */
+        case 45:  return "2.7K 16:9";   /* 2688x1512 */
         case 66:  return "1080P 9:16";
         case 67:  return "2.7K 9:16";
-        case 95:  return "2.7K 4:3";
-        case 103: return "4K 4:3";
+        case 95:  return "2.7K 4:3";    /* 2688x2016 */
+        case 103: return "4K 4:3";      /* 3840x2880 */
         case 109: return "4K 9:16";
         default:  return "-";
     }
@@ -409,9 +410,9 @@ static void update_camera_block(int idx) {
 
     if (!show_title) return;
 
-    /* DJI advertises "OsmoNano-C2D8" / "XtraEdgePro-2DCA16"; only the trailing
-     * chars distinguish two cameras, and the title strip has no room for the
-     * model prefix. Show the last 4. */
+    /* DJI advertises names like "OsmoNano-C2D8"; only the trailing chars
+     * distinguish two cameras, and the title strip has no room for the model
+     * prefix. Show the last 4. */
     lv_label_set_text(cb->title, short_camera_name(st->model_name));
 
     if (!show_full) return;
@@ -424,6 +425,21 @@ static void update_camera_block(int idx) {
         if (st->camera_supports_new_status_push && st->mode_name[0] != '\0') {
             lv_label_set_text_fmt(cb->vmode_label, "%s\n%s",
                                   st->mode_name, st->mode_param);
+        } else if (cam_mode == OSMO_MODE_PHOTO) {
+            /* Photo settings come from cam_photo_param_new — video_resolution/
+             * fps_idx keep describing the VIDEO setting here and would read as
+             * a photo spec that is simply wrong.  Either label may be NULL for
+             * a code we have not observed; omit it rather than print a
+             * placeholder beside a real value. */
+            const char *size   = osmo_photo_size_name(st->photo_size);
+            const char *aspect = osmo_photo_aspect_name(st->photo_aspect);
+            if (size && aspect) {
+                lv_label_set_text_fmt(cb->vmode_label, "Photo\n%s %s", size, aspect);
+            } else if (aspect) {
+                lv_label_set_text_fmt(cb->vmode_label, "Photo\n%s", aspect);
+            } else {
+                lv_label_set_text_fmt(cb->vmode_label, "%s", osmo_mode_name(cam_mode));
+            }
         } else {
             const char *res = short_resolution(st->video_resolution);
             const char *fps = fps_idx_to_string((fps_idx_t)st->fps_idx);
