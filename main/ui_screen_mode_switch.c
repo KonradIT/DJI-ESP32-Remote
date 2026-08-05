@@ -182,7 +182,7 @@ void ui_screen_mode_switch_update(void) {
 
     /* shoot_mode comes from the camera's own status push, so it is right even
      * when the mode was changed on the camera rather than from here. */
-    const lv_image_dsc_t *mode_ico = (cam->shoot_mode == OSMO_MODE_PHOTO)
+    const lv_image_dsc_t *mode_ico = (cam->shoot_mode == CAM_MODE_PHOTO)
                                          ? &lvgl_photo_icon
                                          : &lvgl_video_icon;
     lv_image_set_src(s_mode_icon, mode_ico);
@@ -194,8 +194,8 @@ void ui_screen_mode_switch_update(void) {
     } else {
         /* Name the mode, then the detail line. Photo has no video resolution or
          * fps to show, so don't render placeholders for them. */
-        const char *name = osmo_mode_name(cam->shoot_mode);
-        if (cam->shoot_mode == OSMO_MODE_PHOTO) {
+        const char *name = cam_mode_name(cam->shoot_mode);
+        if (cam->shoot_mode == CAM_MODE_PHOTO) {
             /* Photo has no video resolution/fps; show its own size + aspect
              * from cam_photo_param_new, omitting either if unmapped. */
             const char *size   = osmo_photo_size_name(cam->photo_size);

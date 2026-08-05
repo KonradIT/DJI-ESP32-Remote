@@ -80,6 +80,19 @@ const camera_engine_t *camera_engine_from_rsdk_device_id(uint32_t device_id)
     }
 }
 
+const char *cam_mode_name(cam_mode_t mode)
+{
+    switch (mode) {
+        case CAM_MODE_VIDEO:      return "Video";
+        case CAM_MODE_PHOTO:      return "Photo";
+        case CAM_MODE_TIMELAPSE:  return "TimeLapse";
+        case CAM_MODE_SLOWMO:     return "SlowMo";
+        case CAM_MODE_HYPERLAPSE: return "HyperLapse";
+        case CAM_MODE_SUPERNIGHT: return "SuperNight";
+        default:                  return "Unknown";
+    }
+}
+
 const camera_engine_t *camera_engine_for_slot(int slot)
 {
     if (slot < 0 || slot >= NUM_CAMERAS) return NULL;

@@ -55,6 +55,29 @@ static esp_err_t media_set_mode(int slot, cam_mode_t mode)
     return command_logic_set_shoot_mode(slot, osmo);
 }
 
+cam_mode_t media_mode_from_wire(uint8_t wire)
+{
+    switch (wire) {
+        case OSMO_MODE_VIDEO:      return CAM_MODE_VIDEO;
+        case OSMO_MODE_PHOTO:      return CAM_MODE_PHOTO;
+        case OSMO_MODE_TIMELAPSE:  return CAM_MODE_TIMELAPSE;
+        case OSMO_MODE_SLOWMO:     return CAM_MODE_SLOWMO;
+        case OSMO_MODE_HYPERLAPSE: return CAM_MODE_HYPERLAPSE;
+        case OSMO_MODE_SUPERNIGHT: return CAM_MODE_SUPERNIGHT;
+        default:                   return CAM_MODE_UNKNOWN;
+    }
+}
+
+/*
+ * The camera's on-screen carousel order, in neutral terms. NOT numeric order —
+ * the wire enum is sparse and unordered (0,1,2,5,0x0A,0x28), so the next mode
+ * can only ever come from a table.
+ */
+static const cam_mode_t MEDIA_CAROUSEL[] = {
+    CAM_MODE_VIDEO, CAM_MODE_PHOTO, CAM_MODE_TIMELAPSE,
+    CAM_MODE_HYPERLAPSE, CAM_MODE_SUPERNIGHT, CAM_MODE_SLOWMO,
+};
+
 /*
  * Cycle by table lookup on the mode the camera last reported.
  *
@@ -68,28 +91,26 @@ static esp_err_t media_set_mode(int slot, cam_mode_t mode)
  */
 static esp_err_t media_mode_cycle(int slot)
 {
-    static const uint8_t carousel[] = OSMO_MODE_CAROUSEL;
-    const int n = (int)(sizeof(carousel) / sizeof(carousel[0]));
-
-    uint8_t cur = g_camera_states[slot].shoot_mode;
+    const int n = (int)(sizeof(MEDIA_CAROUSEL) / sizeof(MEDIA_CAROUSEL[0]));
+    cam_mode_t cur = g_camera_states[slot].shoot_mode;
 
     int idx = -1;
     for (int i = 0; i < n; i++) {
-        if (carousel[i] == cur) { idx = i; break; }
+        if (MEDIA_CAROUSEL[i] == cur) { idx = i; break; }
     }
     if (idx < 0) {
         /* No status push seen yet, or the camera is in a mode we have never
          * observed. Advancing from an unknown position would jump the user
          * somewhere arbitrary, so do nothing and say why. */
-        ESP_LOGW(TAG, "Camera %d: current mode 0x%02X not in carousel, not cycling",
-                 slot, cur);
+        ESP_LOGW(TAG, "Camera %d: current mode %s not in carousel, not cycling",
+                 slot, cam_mode_name(cur));
         return ESP_ERR_INVALID_STATE;
     }
 
-    uint8_t next = carousel[(idx + 1) % n];
+    cam_mode_t next = MEDIA_CAROUSEL[(idx + 1) % n];
     ESP_LOGI(TAG, "Camera %d: mode %s -> %s",
-             slot, osmo_mode_name(cur), osmo_mode_name(next));
-    return command_logic_set_shoot_mode(slot, next);
+             slot, cam_mode_name(cur), cam_mode_name(next));
+    return media_set_mode(slot, next);
 }
 
 const camera_engine_t g_engine_media = {

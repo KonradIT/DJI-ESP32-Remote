@@ -182,11 +182,14 @@ void update_camera_state_handler(int camera_index, void *data) {
         }
         /* @57 echoes the last 0x02/0xE1 written, so it tracks the mode whether
          * we set it or the user did it on the camera. */
-        if (len > OSMO_STATUS_MODE && cam->shoot_mode != p[OSMO_STATUS_MODE]) {
-            cam->shoot_mode = p[OSMO_STATUS_MODE];
+        cam_mode_t pushed = (len > OSMO_STATUS_MODE)
+                                ? media_mode_from_wire(p[OSMO_STATUS_MODE])
+                                : CAM_MODE_UNKNOWN;
+        if (len > OSMO_STATUS_MODE && cam->shoot_mode != pushed) {
+            cam->shoot_mode = pushed;
             changed = true;
-            ESP_LOGI(TAG, "Camera %d: mode -> %s (0x%02X)", camera_index,
-                     osmo_mode_name(cam->shoot_mode), cam->shoot_mode);
+            ESP_LOGI(TAG, "Camera %d: mode -> %s (wire 0x%02X)", camera_index,
+                     cam_mode_name(cam->shoot_mode), p[OSMO_STATUS_MODE]);
         }
     } else if (blob->cmd_set == OSMO_CMDSET_SESSION && blob->cmd_id == OSMO_CMDID_CFG_ITEM) {
         /*

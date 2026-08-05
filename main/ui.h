@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "esp_err.h"
+#include "camera_engine.h"   /* cam_mode_t — the neutral vocabulary */
 #include "connect_logic.h"
 #include "ui_screen_main.h"
 #include "ui_screen_pairing.h"
@@ -105,10 +106,12 @@ typedef struct camera_state_s {
 
     // Camera status fields
     uint8_t camera_mode;
-    /* Osmo shooting mode (osmo_mode_t), read from the 0x02/0x80 push @57.
-     * Sparse enum — Video 0x01, Photo 0x05, SlowMo 0x00 … see osmo_duml.h.
+    /* Shooting mode in protocol-neutral terms, decoded from the 0x02/0x80 push.
+     * Deliberately NOT the wire value: shared state holding one protocol's enum
+     * is how UI and shutter logic ended up comparing an Action camera's mode
+     * against media constants. Render it with cam_mode_name().
      * Distinct from camera_mode above, which is the legacy R-SDK enum. */
-    uint8_t shoot_mode;
+    cam_mode_t shoot_mode;
     uint8_t camera_status;
     uint8_t video_resolution;
     uint8_t fps_idx;

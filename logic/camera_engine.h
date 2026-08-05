@@ -138,6 +138,27 @@ esp_err_t rsdk_probe_identity(int slot, uint32_t *out_device_id);
  */
 esp_err_t rsdk_key_report(int slot, uint8_t key_code, uint8_t mode, uint8_t key_value);
 
+/*
+ * Display name for a mode, protocol-neutral. Screens use this instead of
+ * osmo_mode_name() so that rendering a mode does not require the UI to include
+ * a protocol header — and so an Action body is never labelled from the media
+ * enum.
+ */
+const char *cam_mode_name(cam_mode_t mode);
+
+/*
+ * Decode a shooting mode out of a DUML 0x02/0x80 status push (byte
+ * OSMO_STATUS_MODE) into the neutral enum.
+ *
+ * Lives on the media engine because the byte is a media wire value. Note the
+ * status push itself is DUML on BOTH families — Action bodies emit it too —
+ * so this is also what decodes an Action camera's mode today. Whether the
+ * encoding truly matches across families is UNVERIFIED; it is what the code
+ * has always assumed, now stated explicitly instead of implied by storing a
+ * raw byte in shared state.
+ */
+cam_mode_t media_mode_from_wire(uint8_t wire);
+
 /* The engine bound to a slot, or NULL if unresolved. Never guesses. */
 const camera_engine_t *camera_engine_for_slot(int slot);
 bool camera_engine_slot_has_cap(int slot, uint32_t cap);

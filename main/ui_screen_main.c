@@ -375,7 +375,7 @@ static void update_camera_block(int idx) {
     /* shoot_mode is the live value from the camera's status push; camera_mode
      * is the legacy R-SDK field and is never populated by the DUML port, so
      * using it left the main screen stuck showing Video forever. */
-    uint8_t cam_mode = st->shoot_mode;
+    cam_mode_t cam_mode = st->shoot_mode;
 
     /* Selection indicator */
     bool selected;
@@ -425,7 +425,7 @@ static void update_camera_block(int idx) {
         if (st->camera_supports_new_status_push && st->mode_name[0] != '\0') {
             lv_label_set_text_fmt(cb->vmode_label, "%s\n%s",
                                   st->mode_name, st->mode_param);
-        } else if (cam_mode == OSMO_MODE_PHOTO) {
+        } else if (cam_mode == CAM_MODE_PHOTO) {
             /* Photo settings come from cam_photo_param_new — video_resolution/
              * fps_idx keep describing the VIDEO setting here and would read as
              * a photo spec that is simply wrong.  Either label may be NULL for
@@ -438,7 +438,7 @@ static void update_camera_block(int idx) {
             } else if (aspect) {
                 lv_label_set_text_fmt(cb->vmode_label, "Photo\n%s", aspect);
             } else {
-                lv_label_set_text_fmt(cb->vmode_label, "%s", osmo_mode_name(cam_mode));
+                lv_label_set_text_fmt(cb->vmode_label, "%s", cam_mode_name(cam_mode));
             }
         } else {
             const char *res = short_resolution(st->video_resolution);

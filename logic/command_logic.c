@@ -308,7 +308,7 @@ esp_err_t command_logic_shutter_async(int camera_index) {
      * the media engine has a dedicated opcode, while R-SDK has none and reuses
      * record-start, letting the camera decide from the mode it is already in.
      */
-    if (g_camera_states[camera_index].shoot_mode == OSMO_MODE_PHOTO) {
+    if (g_camera_states[camera_index].shoot_mode == CAM_MODE_PHOTO) {
         return e->shoot_photo(camera_index);
     }
     return e->record_start(camera_index);

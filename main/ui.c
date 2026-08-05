@@ -2640,10 +2640,10 @@ void ui_screen_main(void) {
     /* Shutter behaviour follows the mode the CAMERA reports (status offset 57),
      * not the legacy camera_mode field, which nothing populates on this body. */
     ESP_LOGI(TAG, "Camera %d: shoot_mode=%s status=%d recording=%s", cam_idx,
-             osmo_mode_name(cam_state->shoot_mode), cam_state->camera_status,
+             cam_mode_name(cam_state->shoot_mode), cam_state->camera_status,
              cam_state->is_recording ? "yes" : "no");
 
-    if (cam_state->shoot_mode == OSMO_MODE_PHOTO) {
+    if (cam_state->shoot_mode == CAM_MODE_PHOTO) {
         /* Photo mode — shutter (0x02/0x01 [01]). Fire-and-forget: the camera
          * completes a burst or interval sequence on its own, so there is no
          * stop and no recording state to toggle. */
