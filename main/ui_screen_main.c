@@ -431,8 +431,8 @@ static void update_camera_block(int idx) {
              * a photo spec that is simply wrong.  Either label may be NULL for
              * a code we have not observed; omit it rather than print a
              * placeholder beside a real value. */
-            const char *size   = osmo_photo_size_name(st->photo_size);
-            const char *aspect = osmo_photo_aspect_name(st->photo_aspect);
+            const char *size   = cam_photo_size_name(st->photo_size);
+            const char *aspect = cam_photo_aspect_name(st->photo_aspect);
             if (size && aspect) {
                 lv_label_set_text_fmt(cb->vmode_label, "Photo\n%s %s", size, aspect);
             } else if (aspect) {

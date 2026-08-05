@@ -115,11 +115,12 @@ typedef struct camera_state_s {
     uint8_t camera_status;
     uint8_t video_resolution;
     uint8_t fps_idx;
-    /* Photo setting, from cam_photo_param_new (bytes 3 and 4). Separate from
-     * video_resolution/fps_idx, which keep reporting the VIDEO setting even
-     * while the camera is in photo mode. See osmo_duml.h for the codes. */
-    uint8_t photo_size;
-    uint8_t photo_aspect;
+    /* Photo setting, decoded from cam_photo_param_new (bytes 3 and 4). Separate
+     * from video_resolution/fps_idx, which keep reporting the VIDEO setting
+     * even while the camera is in photo mode. Neutral enums, not wire values —
+     * render with cam_photo_size_name() / cam_photo_aspect_name(). */
+    cam_photo_size_t   photo_size;
+    cam_photo_aspect_t photo_aspect;
     uint8_t eis_mode;
     uint8_t user_mode;
     uint8_t camera_mode_next_flag;

@@ -68,6 +68,24 @@ cam_mode_t media_mode_from_wire(uint8_t wire)
     }
 }
 
+cam_photo_size_t media_photo_size_from_wire(uint8_t wire)
+{
+    switch (wire) {
+        case OSMO_PHOTO_SIZE_M: return CAM_PHOTO_SIZE_M;
+        case OSMO_PHOTO_SIZE_L: return CAM_PHOTO_SIZE_L;
+        default:                return CAM_PHOTO_SIZE_UNKNOWN;
+    }
+}
+
+cam_photo_aspect_t media_photo_aspect_from_wire(uint8_t wire)
+{
+    switch (wire) {
+        case OSMO_PHOTO_ASPECT_4_3:  return CAM_PHOTO_ASPECT_4_3;
+        case OSMO_PHOTO_ASPECT_16_9: return CAM_PHOTO_ASPECT_16_9;
+        default:                     return CAM_PHOTO_ASPECT_UNKNOWN;
+    }
+}
+
 /*
  * The camera's on-screen carousel order, in neutral terms. NOT numeric order —
  * the wire enum is sparse and unordered (0,1,2,5,0x0A,0x28), so the next mode

@@ -251,14 +251,19 @@ void update_camera_state_handler(int camera_index, void *data) {
              * video setting while the camera is in photo mode. */
             if (name_len == 19 && strncmp(name, "cam_photo_param_new", 19) == 0 &&
                 val_len > OSMO_PHOTO_PARAM_ASPECT_OFF) {
-                uint8_t size   = val[OSMO_PHOTO_PARAM_SIZE_OFF];
-                uint8_t aspect = val[OSMO_PHOTO_PARAM_ASPECT_OFF];
+                uint8_t size_wire   = val[OSMO_PHOTO_PARAM_SIZE_OFF];
+                uint8_t aspect_wire = val[OSMO_PHOTO_PARAM_ASPECT_OFF];
+                cam_photo_size_t   size   = media_photo_size_from_wire(size_wire);
+                cam_photo_aspect_t aspect = media_photo_aspect_from_wire(aspect_wire);
                 if (cam->photo_size != size || cam->photo_aspect != aspect) {
                     cam->photo_size = size;
                     cam->photo_aspect = aspect;
                     changed = true;
-                    ESP_LOGI(TAG, "Camera %d: photo size %u aspect %u",
-                             camera_index, size, aspect);
+                    ESP_LOGI(TAG, "Camera %d: photo size %s aspect %s (wire %u/%u)",
+                             camera_index,
+                             cam_photo_size_name(size)     ? cam_photo_size_name(size)     : "?",
+                             cam_photo_aspect_name(aspect) ? cam_photo_aspect_name(aspect) : "?",
+                             size_wire, aspect_wire);
                 }
             }
         }

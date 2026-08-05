@@ -51,6 +51,33 @@ typedef enum {
     CAM_MODE_UNKNOWN,
 } cam_mode_t;
 
+/*
+ * Photo size / aspect, protocol-neutral. UNKNOWN is deliberately 0 so a
+ * zero-initialised camera_state_t reads as "not reported yet" — the wire
+ * encoding has 4:3 at 0x00, which meant an un-pushed camera previously
+ * rendered a confident "4:3" it had never been told.
+ */
+typedef enum {
+    CAM_PHOTO_SIZE_UNKNOWN = 0,
+    CAM_PHOTO_SIZE_M,
+    CAM_PHOTO_SIZE_L,
+} cam_photo_size_t;
+
+typedef enum {
+    CAM_PHOTO_ASPECT_UNKNOWN = 0,
+    CAM_PHOTO_ASPECT_4_3,
+    CAM_PHOTO_ASPECT_16_9,
+} cam_photo_aspect_t;
+
+/* NULL when unknown — callers omit the label rather than print a placeholder
+ * beside a real value. Do not "helpfully" return a string here. */
+const char *cam_photo_size_name(cam_photo_size_t size);
+const char *cam_photo_aspect_name(cam_photo_aspect_t aspect);
+
+/* Decode from cam_photo_param_new (bytes 3 and 4). Media wire values. */
+cam_photo_size_t   media_photo_size_from_wire(uint8_t wire);
+cam_photo_aspect_t media_photo_aspect_from_wire(uint8_t wire);
+
 /* What a body can actually do — replaces device-id special-casing at call sites. */
 #define CAM_CAP_GPS         (1u << 0)   /* accepts GPS push (R-SDK only)        */
 #define CAM_CAP_HIGHLIGHT   (1u << 1)   /* highlight/tag while recording        */

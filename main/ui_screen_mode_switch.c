@@ -12,7 +12,6 @@
 #include "lvgl_icons.h"
 #include "command_logic.h"
 #include "enums_logic.h"
-#include "osmo_duml.h"
 #include "esp_log.h"
 #include <string.h>
 #include <stdio.h>
@@ -198,8 +197,8 @@ void ui_screen_mode_switch_update(void) {
         if (cam->shoot_mode == CAM_MODE_PHOTO) {
             /* Photo has no video resolution/fps; show its own size + aspect
              * from cam_photo_param_new, omitting either if unmapped. */
-            const char *size   = osmo_photo_size_name(cam->photo_size);
-            const char *aspect = osmo_photo_aspect_name(cam->photo_aspect);
+            const char *size   = cam_photo_size_name(cam->photo_size);
+            const char *aspect = cam_photo_aspect_name(cam->photo_aspect);
             if (size && aspect) {
                 lv_label_set_text_fmt(s_mode_text, "%s\n%s %s", name, size, aspect);
             } else if (aspect) {

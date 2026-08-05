@@ -93,6 +93,24 @@ const char *cam_mode_name(cam_mode_t mode)
     }
 }
 
+const char *cam_photo_size_name(cam_photo_size_t size)
+{
+    switch (size) {
+        case CAM_PHOTO_SIZE_M: return "M";
+        case CAM_PHOTO_SIZE_L: return "L";
+        default:               return NULL;   /* omit, never guess */
+    }
+}
+
+const char *cam_photo_aspect_name(cam_photo_aspect_t aspect)
+{
+    switch (aspect) {
+        case CAM_PHOTO_ASPECT_4_3:  return "4:3";
+        case CAM_PHOTO_ASPECT_16_9: return "16:9";
+        default:                    return NULL;
+    }
+}
+
 const camera_engine_t *camera_engine_for_slot(int slot)
 {
     if (slot < 0 || slot >= NUM_CAMERAS) return NULL;
