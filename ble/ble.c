@@ -754,7 +754,10 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
                         int unidentified = -1;
                         for (int j = 0; j < BLE_MAX_CAMERAS; j++) {
                             ble_profile_t *pj = get_profile_by_camera_index(j);
-                            if (s_boot_scan_slots[j] && pj && pj->adv_model_id == 0) {
+                            /* A slot seeded from its pairing already has an id;
+                             * only a genuinely unknown one is worth waiting for. */
+                            if (s_boot_scan_slots[j] && pj &&
+                                pj->adv_model_id == 0 && pj->adv_model_id_seed == 0) {
                                 unidentified = j;
                                 break;
                             }
@@ -1918,6 +1921,12 @@ void ble_set_target_device(int camera_index, const char* name, const uint8_t* ma
  */
 uint32_t ble_get_adv_model_id(int camera_index) {
     ble_profile_t *p = get_profile_by_camera_index(camera_index);
+    if (p == NULL) return 0;
+    return p->adv_model_id ? p->adv_model_id : p->adv_model_id_seed;
+}
+
+uint32_t ble_get_adv_model_id_from_air(int camera_index) {
+    ble_profile_t *p = get_profile_by_camera_index(camera_index);
     return p ? p->adv_model_id : 0;
 }
 
@@ -1929,7 +1938,7 @@ uint32_t ble_get_adv_model_id(int camera_index) {
  */
 void ble_set_adv_model_id(int camera_index, uint32_t model_id) {
     ble_profile_t *p = get_profile_by_camera_index(camera_index);
-    if (p && model_id != 0 && p->adv_model_id == 0) {
-        p->adv_model_id = model_id;
+    if (p && model_id != 0) {
+        p->adv_model_id_seed = model_id;   /* never the air-latched field */
     }
 }

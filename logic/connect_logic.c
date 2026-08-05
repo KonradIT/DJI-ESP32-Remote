@@ -524,7 +524,7 @@ int connect_logic_protocol_connect(int camera_index, uint32_t device_id, uint8_t
      * not "no id". This is still positive identification — the id was read off
      * this camera's own advertisement, just on an earlier scan.
      */
-    uint32_t scanned_id = ble_get_adv_model_id(camera_index);
+    uint32_t scanned_id = ble_get_adv_model_id_from_air(camera_index);
     uint32_t adv_id     = scanned_id ? scanned_id
                                      : g_camera_states[camera_index].adv_model_id;
 

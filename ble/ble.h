@@ -75,6 +75,13 @@ typedef struct {
      * would be a coin flip. */
     uint32_t adv_model_id;
 
+    /* The same id restored from the stored pairing, kept SEPARATE from the
+     * latched one so "did we hear this off the air on this boot?" stays an
+     * answerable question. Folding the two together made a seeded value
+     * indistinguishable from a fresh reading and produced a log line that
+     * claimed a scan had seen an id it never saw. */
+    uint32_t adv_model_id_seed;
+
     connection_status_t connection_status;
     handle_discovery_t handle_discovery;
 } ble_profile_t;
@@ -110,8 +117,11 @@ esp_err_t ble_stop_advertising_early(void);
 
 const char* ble_get_connected_device_name(int camera_index);
 
-/* Advertised DJI model id latched for this slot while scanning, 0 if none. */
+/* Best known advertised DJI model id: heard this boot if we heard one,
+ * otherwise the value restored from the pairing. 0 if neither. */
 uint32_t ble_get_adv_model_id(int camera_index);
+/* Only what was heard off the air on THIS boot. 0 means "not observed". */
+uint32_t ble_get_adv_model_id_from_air(int camera_index);
 const uint8_t* ble_get_connected_device_mac(int camera_index);
 bool ble_get_connected_device_info(int camera_index, char* name, size_t name_size, uint8_t* mac);
 uint16_t ble_get_conn_id(int camera_index);
