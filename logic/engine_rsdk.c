@@ -31,6 +31,16 @@
 #define RSDK_CMDSET_CAMERA        0x1D
 #define RSDK_CMDID_MODE_SWITCH    0x04
 #define RSDK_CMDID_RECORD_CTRL    0x03
+#define RSDK_CMDID_KEY_REPORT     0x11   /* on cmd set 0x00, not 0x1D */
+
+/* Key codes carried by 0x00/0x11. QS is context-dependent ON THE CAMERA: a
+ * short press cycles the shooting mode when idle, and drops a highlight marker
+ * while recording. Both callers therefore send the same code — that is the
+ * camera's behaviour, not a mix-up. */
+#define RSDK_KEY_QS               0x02
+#define RSDK_KEY_SNAPSHOT         0x03
+#define RSDK_KEY_MODE_EVENTS      0x01   /* report key events, not up/down */
+#define RSDK_KEY_SHORT_PRESS      0x00
 
 /* record_ctrl — NOTE the inversion versus the media engine, where [01] starts. */
 #define RSDK_RECORD_START         0x00
@@ -201,15 +211,31 @@ static esp_err_t rsdk_set_mode(int slot, cam_mode_t mode)
 }
 
 /*
- * The QS ("quick switch") key report — the physical mode button on a DJI
- * remote. The camera picks the next mode itself, so unlike the media engine
- * there is nothing to look up and no dependence on having seen a status push.
- * This is the behaviour the mode screen has always had on Action bodies; it is
- * only moving behind the interface so a Nano stops receiving it.
+ * Key report — 0x00/0x11. The remote reports a button press and the CAMERA
+ * decides what it means, which is why there is nothing to look up here.
+ *
+ * This used to route through command_logic_send_key_report_for_slot(), which
+ * during the DUML-only port had been hollowed out into a translation shim that
+ * emitted DUML 0x02/0xE1 regardless of key code. That sent a media frame to an
+ * Action body for both mode cycling AND highlight — the exact cross-protocol
+ * failure the engine split exists to prevent.
  */
+esp_err_t rsdk_key_report(int slot, uint8_t key_code, uint8_t mode, uint8_t key_value)
+{
+    key_report_command_frame_t body = {
+        .key_code  = key_code,
+        .mode      = mode,
+        .key_value = key_value,
+    };
+    ESP_LOGI(TAG, "Camera %d: key report 0x%02X (mode 0x%02X, value 0x%02X)",
+             slot, key_code, mode, key_value);
+    return rsdk_send_set(slot, RSDK_CMDSET_SESSION, RSDK_CMDID_KEY_REPORT, &body);
+}
+
+/* The physical mode button. Idle -> next mode; recording -> highlight marker. */
 static esp_err_t rsdk_mode_cycle(int slot)
 {
-    return command_logic_send_key_report_for_slot(slot, 0x02, 0x01, 0x00);
+    return rsdk_key_report(slot, RSDK_KEY_QS, RSDK_KEY_MODE_EVENTS, RSDK_KEY_SHORT_PRESS);
 }
 
 static esp_err_t rsdk_session_open(int slot)

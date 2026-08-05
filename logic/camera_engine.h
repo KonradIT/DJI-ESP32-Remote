@@ -130,6 +130,14 @@ const camera_engine_t *camera_engine_from_rsdk_device_id(uint32_t device_id);
  */
 esp_err_t rsdk_probe_identity(int slot, uint32_t *out_device_id);
 
+/*
+ * R-SDK key report (0x00/0x11). Exposed because highlight is an R-SDK-only
+ * feature driven from shared code — the caller MUST have checked
+ * CAM_CAP_HIGHLIGHT (or otherwise know the slot is R-SDK) first, since this
+ * writes an 0xAA frame unconditionally.
+ */
+esp_err_t rsdk_key_report(int slot, uint8_t key_code, uint8_t mode, uint8_t key_value);
+
 /* The engine bound to a slot, or NULL if unresolved. Never guesses. */
 const camera_engine_t *camera_engine_for_slot(int slot);
 bool camera_engine_slot_has_cap(int slot, uint32_t cap);

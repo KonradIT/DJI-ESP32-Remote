@@ -77,9 +77,9 @@ camera_power_mode_switch_response_frame_t* command_logic_power_mode_switch_wake(
 
 gps_data_push_response_frame_t* command_logic_push_gps_data(int camera_index, const gps_data_push_command_frame_t* frame);
 
-// Key Reporting functions
-esp_err_t command_logic_send_key_report_for_slot(int camera_index, uint8_t key_code, uint8_t mode, uint8_t key_value);
-esp_err_t command_logic_send_snapshot_key_for_slot(int camera_index);
+/* Key reporting is R-SDK-only and lives on that engine — see rsdk_key_report()
+ * in camera_engine.h. The shim that used to live here translated every key
+ * code into a DUML frame, which silently sent media frames to Action bodies. */
 
 // Highlight tag functions
 bool command_logic_slot_supports_highlight(int slot_index);

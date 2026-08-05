@@ -457,8 +457,6 @@ bool command_logic_slot_is_recording(int slot_index) {
  * alone had looked like a dead end.  Every value was then confirmed by picking
  * that mode by hand and reading it back from the status push.
  */
-static const uint8_t MODE_CAROUSEL[] = OSMO_MODE_CAROUSEL;
-
 esp_err_t command_logic_set_shoot_mode(int camera_index, uint8_t mode) {
     ESP_LOGI(TAG, "Camera %d: set shooting mode %s (0x%02X)",
              camera_index, osmo_mode_name(mode), mode);
@@ -466,24 +464,10 @@ esp_err_t command_logic_set_shoot_mode(int camera_index, uint8_t mode) {
                      OSMO_CMDID_SET_SHOOT_MODE, OSMO_FLAGS_REQUEST, &mode, 1);
 }
 
-/*
- * Advance from whatever the camera *reports* rather than a local cursor, so the
- * remote stays in step when the mode is changed on the camera itself.
- */
-static esp_err_t cycle_shoot_mode(int camera_index) {
-    extern camera_state_t g_camera_states[NUM_CAMERAS];
-    const uint8_t n = (uint8_t)(sizeof(MODE_CAROUSEL) / sizeof(MODE_CAROUSEL[0]));
-    const uint8_t cur = g_camera_states[camera_index].shoot_mode;
-
-    uint8_t at = 0;
-    for (uint8_t i = 0; i < n; i++) {
-        if (MODE_CAROUSEL[i] == cur) {
-            at = (uint8_t)(i + 1);
-            break;
-        }
-    }
-    return command_logic_set_shoot_mode(camera_index, MODE_CAROUSEL[at % n]);
-}
+/* Cycling lives on the media engine (engine_media.c), which owns the carousel
+ * and the read-back. This copy advanced to Video whenever the current mode was
+ * unrecognised; the engine refuses instead, so an unknown mode cannot silently
+ * move the camera somewhere the user did not ask for. */
 
 /* ==========================================================================
  * Camera parameters — 0x02/0x8E
@@ -538,33 +522,6 @@ esp_err_t command_logic_set_iso_limit(int camera_index, osmo_iso_limit_t iso) {
  *     it mutates camera state before you have even started testing.
  */
 
-esp_err_t command_logic_send_key_report_for_slot(int camera_index, uint8_t key_code, uint8_t mode, uint8_t key_value) {
-    (void)mode;
-    (void)key_value;
-    if (camera_index < 0 || camera_index >= NUM_CAMERAS) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    extern camera_state_t g_camera_states[NUM_CAMERAS];
-    camera_state_t *cam_state = &g_camera_states[camera_index];
-    if (!cam_state->is_paired || !cam_state->is_connected ||
-        cam_state->connection_state != CAM_STATE_CONNECTED ||
-        !ble_is_camera_connected(camera_index)) {
-        ESP_LOGD(TAG, "Camera %d: not connected, cannot send key report", camera_index);
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    /* key_code 0x02 = QS (cycle mode), 0x03 = snapshot -> take photo */
-    if (key_code == 0x03) {
-        ESP_LOGI(TAG, "Camera %d: snapshot key -> take photo", camera_index);
-        return command_logic_take_photo(camera_index);
-    }
-    return cycle_shoot_mode(camera_index);
-}
-
-esp_err_t command_logic_send_snapshot_key_for_slot(int camera_index) {
-    return command_logic_send_key_report_for_slot(camera_index, 0x03, 0x01, 0x00);
-}
-
 esp_err_t command_logic_send_highlight_for_slot(int slot_index) {
     if (slot_index < 0 || slot_index >= NUM_CAMERAS) {
         return ESP_ERR_INVALID_ARG;
@@ -572,7 +529,10 @@ esp_err_t command_logic_send_highlight_for_slot(int slot_index) {
     if (!command_logic_slot_supports_highlight(slot_index)) {
         return ESP_ERR_NOT_SUPPORTED;
     }
-    return command_logic_send_key_report_for_slot(slot_index, 0x02, 0x01, 0x00);
+    /* Safe to send an R-SDK frame directly: the capability check above is the
+     * gate, and it is satisfied only by an R-SDK engine plus a confirmed model.
+     * A QS short press while recording is what sets the highlight marker. */
+    return rsdk_key_report(slot_index, 0x02, 0x01, 0x00);
 }
 
 esp_err_t command_logic_send_highlight_for_all_active(void) {
