@@ -79,8 +79,12 @@ static lv_color_t get_sd_color(uint32_t capacity_mb) {
     return ui_clr_red();
 }
 
-static const lv_image_dsc_t *get_mode_icon(uint8_t camera_mode) {
-    return (camera_mode == 0x05) ? &lvgl_photo_icon : &lvgl_video_icon;
+/* Takes cam_mode_t, NOT a wire value. This compared against a bare 0x05 (the
+ * media wire code for Photo) and kept compiling when the argument became
+ * cam_mode_t — both are integers — so it silently matched nothing and the
+ * icon stuck on Video while the label beside it read "Photo". */
+static const lv_image_dsc_t *get_mode_icon(cam_mode_t mode) {
+    return (mode == CAM_MODE_PHOTO) ? &lvgl_photo_icon : &lvgl_video_icon;
 }
 
 static void get_status_icon_and_color(int idx, const camera_state_t *st,
@@ -555,7 +559,10 @@ static void update_button_a(void) {
             icon = &lvgl_pause_icon; label = "Stop";
         } else if (g_camera_states[slot].is_sleeping) {
             icon = &lvgl_record_icon; label = "Snapsht";
-        } else if (g_camera_states[slot].camera_mode == 0x05) {
+        } else if (g_camera_states[slot].shoot_mode == CAM_MODE_PHOTO) {
+            /* shoot_mode, not camera_mode: the latter is the legacy R-SDK field
+             * that nothing populates, so this button read "Record" in photo
+             * mode even though the shutter correctly took a photo. */
             icon = &lvgl_photo_icon; label = "Photo";
         } else {
             icon = &lvgl_record_icon; label = "Record";
