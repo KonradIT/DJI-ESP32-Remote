@@ -1,7 +1,7 @@
 /*
  * Osmo Nano Remote Control - Command Logic Layer
  *
- * Camera control over the DUML-on-BLE protocol (see protocol/osmo_duml.h).
+ * Camera control over the DUML-on-BLE protocol (see mediaprotocol/osmo_duml.h).
  * Frames are written to the camera's 0xFFF5 characteristic; the camera-control
  * command set (0x02) is fire-and-forget — the authoritative recording/mode
  * state comes back asynchronously via the status pushes handled in

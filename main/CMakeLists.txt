@@ -7,8 +7,10 @@ set(SRCS "app_main.c"
          "ui_screen_mode_switch.c"
          "icons.c"
          "lvgl_icons.c"
-         "../protocol/duml.c"
-         "../protocol/osmo_duml.c"
+         # Media protocol (DUML, 0x55) — Osmo Nano / Pocket 3
+         "../mediaprotocol/duml.c"
+         "../mediaprotocol/osmo_duml.c"
+         # R-SDK (0xAA) — Osmo Action 4 / 5 Pro / 6, Osmo 360
          "../protocol/dji_protocol_parser.c"
          "../protocol/dji_protocol_data_processor.c"
          "../protocol/dji_protocol_data_descriptors.c"
@@ -41,7 +43,7 @@ endif()
 
 idf_component_register(SRCS ${SRCS}
                     PRIV_REQUIRES bt nvs_flash esp_driver_gpio led_strip esp_driver_spi esp_lcd driver esp_lvgl_port
-                    INCLUDE_DIRS "." "../utils/crc" "../protocol" "../ble" "../data" "../logic" "../gps" "../")
+                    INCLUDE_DIRS "." "../utils/crc" "../protocol" "../mediaprotocol" "../ble" "../data" "../logic" "../gps" "../")
 
 # Board compile-time define — driven by Kconfig
 if(CONFIG_BOARD_M5STACK_BASIC_V27)

@@ -10,7 +10,7 @@ The BLE transport is unchanged — the Nano exposes the same GATT service the
 old code already used: service `0xFFF0`, write-without-response `0xFFF5`,
 notify `0xFFF4`.
 
-## Frame format (`protocol/duml.{c,h}`)
+## Frame format (`mediaprotocol/duml.{c,h}`)
 
 ```
 55 | len:u16(10-bit, ver=1) | crc8(bytes 0-2) | src | dst | seq:u16-BE
