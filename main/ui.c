@@ -34,6 +34,7 @@
 #include "ui.h"
 #include "m5stack_basic_v27_hal.h"
 #include "command_logic.h"
+#include "camera_engine.h"
 #include "status_logic.h"
 #include "enums_logic.h"
 #include "connect_logic.h"
@@ -128,6 +129,19 @@ typedef struct {
     uint32_t fw_version;            /* Camera firmware version for compatibility checks */
     uint16_t verify_data;           /* Last successful verification code for reconnection */
     uint8_t camera_reserved;        /* Camera identifier number in multi-camera setups */
+    /*
+     * Advertised model id (DJI mfg data, 0x0019 = Osmo Nano) — the signal that
+     * picks the protocol engine. Persisted because it CANNOT be relied on to
+     * reappear every boot: a Nano alternates a name-only record with the
+     * mfg-bearing one, and the boot scan stops as soon as the MAC matches, so
+     * the record carrying the id is frequently never seen. Learned once during
+     * the pairing scan (which runs to completion) and reused thereafter.
+     *
+     * Appended LAST on purpose: nvs_get_blob accepts a stored blob shorter than
+     * the buffer, so pairings written before this field existed still load and
+     * simply read back 0 ("unknown"). Keep new fields at the end.
+     */
+    uint32_t adv_model_id;
 } stored_camera_t;
 
 /* Multi-camera state array - holds state for all camera slots
@@ -773,7 +787,8 @@ esp_err_t save_all_cameras_to_nvs(void) {
             .mac_addr_len = g_camera_states[i].mac_addr_len,
             .fw_version = g_camera_states[i].fw_version,
             .verify_data = g_camera_states[i].verify_data,
-            .camera_reserved = g_camera_states[i].camera_reserved
+            .camera_reserved = g_camera_states[i].camera_reserved,
+            .adv_model_id = g_camera_states[i].adv_model_id
         };
         strncpy(stored.camera_name, g_camera_states[i].camera_name, sizeof(stored.camera_name));
         memcpy(stored.camera_mac, g_camera_states[i].camera_mac, 6);
@@ -838,9 +853,12 @@ static esp_err_t load_all_cameras_from_nvs(void) {
         char key[16];
         snprintf(key, sizeof(key), "camera_%d", i);
         
+        /* Zeroed first: a blob written before stored_camera_t grew reads back
+         * short, and nvs_get_blob leaves the remaining bytes untouched. */
         stored_camera_t stored;
+        memset(&stored, 0, sizeof(stored));
         size_t required_size = sizeof(stored_camera_t);
-        
+
         err = nvs_get_blob(nvs_handle, key, &stored, &required_size);
         if (err == ESP_OK && stored.is_paired) {
             // Copy pairing info to camera_state_t
@@ -853,6 +871,7 @@ static esp_err_t load_all_cameras_from_nvs(void) {
             g_camera_states[i].fw_version = stored.fw_version;
             g_camera_states[i].verify_data = stored.verify_data;
             g_camera_states[i].camera_reserved = stored.camera_reserved;
+            g_camera_states[i].adv_model_id = stored.adv_model_id;
             g_camera_states[i].connection_state = CAM_STATE_PAIRED_DISCONNECTED;
             // Initialize 1D06 support flag and tracking fields for loaded camera
             g_camera_states[i].camera_supports_new_status_push = false;  // Will be set to true if 1D06 is received
@@ -1540,6 +1559,17 @@ void ui_pairing_add_discovered_camera(const char *name, const uint8_t *mac, int8
             if (rssi > g_discovered_cameras[i].rssi) {
                 g_discovered_cameras[i].rssi = rssi;
             }
+            /*
+             * Latch the model id on re-sighting. A Nano alternates a name-only
+             * record with the one carrying manufacturer data, and whichever
+             * arrives first creates the entry — so without this the id is a
+             * coin toss, and losing it leaves the slot with no engine.
+             */
+            if (device_id != 0 && g_discovered_cameras[i].device_id != device_id) {
+                g_discovered_cameras[i].device_id = device_id;
+                ESP_LOGI(TAG, "Discovered camera %d: model id 0x%04X",
+                         i, (unsigned int)device_id);
+            }
             return;
         }
     }
@@ -1627,6 +1657,10 @@ static void ui_handle_pairing_screen_button_a(void) {
             cam->camera_name[sizeof(cam->camera_name) - 1] = '\0';
             memcpy(cam->camera_mac, g_discovered_cameras[camera_idx].mac, 6);
             cam->device_id = g_discovered_cameras[camera_idx].device_id;
+            /* Keep the advertised model id in its own field too: device_id is
+             * overwritten by the R-SDK connection result on Action bodies, and
+             * this is the value the engine decision reads. */
+            cam->adv_model_id = g_discovered_cameras[camera_idx].device_id;
             cam->connection_state = CAM_STATE_PAIRED_DISCONNECTED;
             cam->camera_reserved = active_slot;
             cam->camera_supports_new_status_push = false;
@@ -1820,7 +1854,16 @@ static void ui_handle_settings_screen_button_a(void) {
 
         case SETTINGS_ITEM_SLEEP_WAKEUP: {
             ESP_LOGI(TAG, "Settings: Sleep/Wakeup selected");
+
             bool is_sleeping = (cam->power_mode == 3) || cam->is_sleeping;
+
+            /* Only the sleep direction needs the cap — waking is a BLE
+             * advertisement, not an R-SDK frame. See is_camera_sleep_candidate. */
+            if (!is_sleeping && !camera_engine_slot_has_cap(active_slot, CAM_CAP_SLEEP)) {
+                ESP_LOGW(TAG, "Camera %d: engine has no sleep command", active_slot);
+                ui_screen_settings_set_notification("Not supported", lv_color_make(255, 128, 0));
+                break;
+            }
 
             if (is_sleeping) {
                 ui_screen_settings_set_notification("Waking up...", lv_color_make(0, 255, 255));
@@ -2001,12 +2044,24 @@ void ui_update_display(void) {
     lvgl_port_unlock();
 }
 
+/*
+ * Sleeping is an R-SDK power-mode frame with no known media equivalent, so a
+ * Nano must not be counted — otherwise "all cameras" reports it as slept when
+ * nothing was sent.
+ *
+ * Waking deliberately is NOT gated: it is a BLE advertisement addressed to the
+ * camera's MAC (connect_logic_start_wake_broadcast_for_slot), not a protocol
+ * frame, so it is plausibly family-agnostic. Untested on a Nano — but removing
+ * it would be a silent capability loss, and a wake candidate needs is_sleeping,
+ * which nothing on the media path currently sets anyway.
+ */
 static bool is_camera_sleep_candidate(int slot) {
     camera_state_t *cam = &g_camera_states[slot];
     return cam->is_paired
         && cam->connection_state == CAM_STATE_CONNECTED
         && !cam->is_sleeping
-        && !cam->is_recording;
+        && !cam->is_recording
+        && camera_engine_slot_has_cap(slot, CAM_CAP_SLEEP);
 }
 
 static bool is_camera_wake_candidate(int slot) {

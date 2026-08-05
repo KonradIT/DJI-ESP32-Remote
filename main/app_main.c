@@ -55,6 +55,7 @@
 #include "esp_lvgl_port.h"
 #include "../gps/gps_reader.h"
 #include "command_logic.h"
+#include "camera_engine.h"
 #include "freertos/task.h"
 #include "dji_protocol_data_structures.h"
 #include "../log_config.h"
@@ -570,9 +571,17 @@ static void gps_transmission_task(void *pvParameters) {
              * for that camera to avoid BLE write failures. GPS sending resumes automatically
              * when camera wakes (power_mode != 3).
              */
-            if (g_camera_states[cam_idx].connection_state == CAM_STATE_CONNECTED && 
-                !g_camera_states[cam_idx].is_sleeping) {
-                
+            /*
+             * GPS push is an R-SDK frame (0xAA framing, 0x00/0x17). A media
+             * body has no equivalent and simply drops it — so without this cap
+             * check we would spray the wrong protocol at a Nano once per GPS
+             * tick, forever. Silent waste, but exactly the thing the engine
+             * split exists to prevent.
+             */
+            if (g_camera_states[cam_idx].connection_state == CAM_STATE_CONNECTED &&
+                !g_camera_states[cam_idx].is_sleeping &&
+                camera_engine_slot_has_cap(cam_idx, CAM_CAP_GPS)) {
+
                 command_logic_push_gps_data(cam_idx, &gps_frame);
                 cameras_receiving_gps++;
             }

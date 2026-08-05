@@ -65,6 +65,16 @@ typedef struct {
     char target_name[BLE_DEVICE_NAME_MAX_LEN];
     uint8_t target_mac[6];
 
+    /* Model id from the DJI manufacturer advertisement (mfg[2..3] LE), latched
+     * during the scan that found this slot's camera. 0 = never seen one.
+     *
+     * A body can emit SEVERAL advertisement records under one MAC and only some
+     * carry manufacturer data — an Osmo Nano alternates "DJI Camera" (mfg data,
+     * id 0x0019) with "OsmoNano-XXXX" (none). So this is only ever written when
+     * non-zero, otherwise whichever record arrived last would win and the id
+     * would be a coin flip. */
+    uint32_t adv_model_id;
+
     connection_status_t connection_status;
     handle_discovery_t handle_discovery;
 } ble_profile_t;
@@ -99,6 +109,9 @@ esp_err_t ble_wake_camera(const uint8_t* camera_mac);
 esp_err_t ble_stop_advertising_early(void);
 
 const char* ble_get_connected_device_name(int camera_index);
+
+/* Advertised DJI model id latched for this slot while scanning, 0 if none. */
+uint32_t ble_get_adv_model_id(int camera_index);
 const uint8_t* ble_get_connected_device_mac(int camera_index);
 bool ble_get_connected_device_info(int camera_index, char* name, size_t name_size, uint8_t* mac);
 uint16_t ble_get_conn_id(int camera_index);
@@ -108,6 +121,7 @@ uint16_t ble_get_cccd_handle(int camera_index);
 bool ble_is_camera_connected(int camera_index);
 
 void ble_set_target_device(int camera_index, const char* name, const uint8_t* mac);
+void ble_set_adv_model_id(int camera_index, uint32_t model_id);
 
 esp_err_t ble_start_scan(scan_mode_t mode, int target_slot, uint32_t timeout_ms);
 esp_err_t ble_stop_scan(void);

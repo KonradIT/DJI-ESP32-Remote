@@ -25,6 +25,7 @@
 #include "data.h"
 #include "duml.h"
 #include "osmo_duml.h"
+#include "camera_engine.h"
 #include "enums_logic.h"
 #include "connect_logic.h"
 #include "command_logic.h"
@@ -161,78 +162,6 @@ static void *alloc_ret_ok(size_t size) {
  * Camera control (cmd set 0x02 — fire-and-forget; state confirmed via pushes)
  * ========================================================================== */
 
-/**
- * @brief Map the UI's camera_mode_t (R-SDK values) to the DUML 0x02/0x02 mode
- */
-static uint8_t osmo_mode_from_camera_mode(camera_mode_t mode) {
-    switch (mode) {
-        case CAMERA_MODE_PHOTO:        return OSMO_MODE_PHOTO;
-        case CAMERA_MODE_NORMAL:       return OSMO_MODE_VIDEO;
-        case CAMERA_MODE_SLOW_MOTION:  return OSMO_MODE_SLOWMO;
-        case CAMERA_MODE_TIMELAPSE:    return OSMO_MODE_TIMELAPSE;
-        default:                       return OSMO_MODE_VIDEO;
-    }
-}
-
-/* Reflect the mode we just commanded back into camera_state_t so the UI icon
- * updates immediately (the DUML camera set does not push camera_mode). */
-static camera_mode_t camera_mode_from_osmo(uint8_t osmo_mode) {
-    switch (osmo_mode) {
-        case OSMO_MODE_PHOTO:     return CAMERA_MODE_PHOTO;
-        case OSMO_MODE_VIDEO:     return CAMERA_MODE_NORMAL;
-        case OSMO_MODE_SLOWMO:    return CAMERA_MODE_SLOW_MOTION;
-        case OSMO_MODE_TIMELAPSE: return CAMERA_MODE_TIMELAPSE;
-        default:                  return CAMERA_MODE_NORMAL;
-    }
-}
-
-/*
- * Modes 0 and 1 are NOT mode switches on this body — they are the record
- * control (see the record section below: [01] starts, [00] stops).  Sending
- * them from a mode-switch press would start or stop a recording behind the
- * user's back, so they are refused here; recording goes through
- * command_logic_start_record/stop_record.  What 2..5 actually do is still
- * unverified on the Nano.
- */
-static esp_err_t set_osmo_mode(int camera_index, uint8_t osmo_mode) {
-    if (osmo_mode == OSMO_MODE_PHOTO || osmo_mode == OSMO_MODE_VIDEO) {
-        ESP_LOGW(TAG, "Camera %d: refusing set-mode %d — that value is the record "
-                      "control on this camera, not a mode", camera_index, osmo_mode);
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-    ESP_LOGI(TAG, "Camera %d: set mode osmo=%d via 0x02/0x02", camera_index, osmo_mode);
-    esp_err_t ret = osmo_send(camera_index, DUML_ADDR_CAMERA,
-                              OSMO_CMDSET_CAMERA, OSMO_CMDID_SET_MODE,
-                              OSMO_FLAGS_REQUEST, &osmo_mode, 1);
-    if (ret == ESP_OK) {
-        extern camera_state_t g_camera_states[NUM_CAMERAS];
-        g_camera_states[camera_index].camera_mode = camera_mode_from_osmo(osmo_mode);
-        g_ui_state.display_needs_update = true;
-    }
-    return ret;
-}
-
-camera_mode_switch_response_frame_t* command_logic_switch_camera_mode(int camera_index, camera_mode_t mode) {
-    if (set_osmo_mode(camera_index, osmo_mode_from_camera_mode(mode)) != ESP_OK) {
-        return NULL;
-    }
-    return (camera_mode_switch_response_frame_t *)alloc_ret_ok(sizeof(camera_mode_switch_response_frame_t));
-}
-
-/* Quick-switch cursor: each press advances through this small ring and sends
- * the DUML set-mode command (DUML has no "cycle to next mode" key-report).
- * VIDEO(1)/PHOTO(0) are deliberately absent — they are the record control on
- * this camera (set_osmo_mode refuses them), so cycling through them would
- * start/stop recordings.  The remaining two are themselves unverified. */
-static const uint8_t QS_MODE_RING[] = {
-    OSMO_MODE_TIMELAPSE, OSMO_MODE_SLOWMO,
-};
-static uint8_t s_qs_cursor[NUM_CAMERAS];
-
-static esp_err_t quick_switch_mode(int camera_index) {
-    s_qs_cursor[camera_index] = (uint8_t)((s_qs_cursor[camera_index] + 1) % (sizeof(QS_MODE_RING)));
-    return set_osmo_mode(camera_index, QS_MODE_RING[s_qs_cursor[camera_index]]);
-}
 
 version_query_response_frame_t* command_logic_get_version(int camera_index) {
     /* DUML version query (0x00/0x00) over BLE is best-effort; the reply
@@ -278,8 +207,36 @@ static esp_err_t send_record_mode(int camera_index, uint8_t mode) {
                      OSMO_CMDID_SET_MODE, OSMO_FLAGS_REQUEST, payload, sizeof(payload));
 }
 
-esp_err_t command_logic_start_record_async(int camera_index) {
+/*
+ * Raw DUML record control. These are the MEDIA ENGINE's implementation, called
+ * from engine_media.c — they must NOT dispatch through the engine or they would
+ * recurse. The public command_logic_*_record_async() below are the dispatching
+ * entry points the UI calls.
+ */
+esp_err_t media_record_start_raw(int camera_index) {
     return send_record_mode(camera_index, OSMO_RECORD_MODE_START);
+}
+
+esp_err_t media_record_stop_raw(int camera_index) {
+    return send_record_mode(camera_index, OSMO_RECORD_MODE_STOP);
+}
+
+esp_err_t command_logic_start_record_async(int camera_index) {
+    const camera_engine_t *e = camera_engine_for_slot(camera_index);
+    if (e == NULL) {
+        ESP_LOGW(TAG, "Camera %d: no engine assigned — refusing record start", camera_index);
+        return ESP_ERR_INVALID_STATE;
+    }
+    return e->record_start(camera_index);
+}
+
+esp_err_t command_logic_mode_cycle_async(int camera_index) {
+    const camera_engine_t *e = camera_engine_for_slot(camera_index);
+    if (e == NULL) {
+        ESP_LOGW(TAG, "Camera %d: no engine assigned — refusing mode cycle", camera_index);
+        return ESP_ERR_INVALID_STATE;
+    }
+    return e->mode_cycle(camera_index);
 }
 
 record_control_response_frame_t* command_logic_start_record(int camera_index) {
@@ -290,7 +247,12 @@ record_control_response_frame_t* command_logic_start_record(int camera_index) {
 }
 
 esp_err_t command_logic_stop_record_async(int camera_index) {
-    return send_record_mode(camera_index, OSMO_RECORD_MODE_STOP);
+    const camera_engine_t *e = camera_engine_for_slot(camera_index);
+    if (e == NULL) {
+        ESP_LOGW(TAG, "Camera %d: no engine assigned — refusing record stop", camera_index);
+        return ESP_ERR_INVALID_STATE;
+    }
+    return e->record_stop(camera_index);
 }
 
 record_control_response_frame_t* command_logic_stop_record(int camera_index) {
@@ -333,27 +295,23 @@ esp_err_t command_logic_shutter_async(int camera_index) {
         return ESP_ERR_INVALID_ARG;
     }
     extern camera_state_t g_camera_states[NUM_CAMERAS];
-    if (g_camera_states[camera_index].shoot_mode == OSMO_MODE_PHOTO) {
-        return command_logic_take_photo(camera_index);
-    }
-    return send_record_mode(camera_index, OSMO_RECORD_MODE_START);
-}
 
-/**
- * @brief Quick-switch mode key report
- *
- * The R-SDK exposed a 0x00/0x11 key-report; the DUML camera set has no direct
- * equivalent, so quick-switch cycles modes with the set-mode command. Kept for
- * API compatibility — it advances to Video as a safe default.
- */
-key_report_response_frame_t* command_logic_key_report_qs(int camera_index) {
-    if (camera_index < 0 || camera_index >= NUM_CAMERAS) {
-        return NULL;
+    const camera_engine_t *e = camera_engine_for_slot(camera_index);
+    if (e == NULL) {
+        ESP_LOGW(TAG, "Camera %d: no engine assigned — refusing shutter", camera_index);
+        return ESP_ERR_INVALID_STATE;
     }
-    if (quick_switch_mode(camera_index) != ESP_OK) {
-        return NULL;
+
+    /*
+     * Photo vs record is decided from the mode the CAMERA reports, then handed
+     * to the engine. Note the two protocols disagree about what a shutter IS:
+     * the media engine has a dedicated opcode, while R-SDK has none and reuses
+     * record-start, letting the camera decide from the mode it is already in.
+     */
+    if (g_camera_states[camera_index].shoot_mode == OSMO_MODE_PHOTO) {
+        return e->shoot_photo(camera_index);
     }
-    return (key_report_response_frame_t *)alloc_ret_ok(sizeof(key_report_response_frame_t));
+    return e->record_start(camera_index);
 }
 
 /* ==========================================================================
@@ -403,12 +361,31 @@ bool command_logic_slot_supports_highlight(int slot_index) {
     if (slot_index < 0 || slot_index >= NUM_CAMERAS) {
         return false;
     }
+    /*
+     * Two gates, coarse then fine.
+     *
+     * The engine cap makes "a media body never gets a highlight frame"
+     * structural rather than a happy accident of the id list below. The id list
+     * then narrows it to the models the opcode is actually confirmed on —
+     * per-model knowledge the engine cap cannot express, since every R-SDK body
+     * shares one engine.
+     *
+     * ⚠ Osmo 360 (0xFF66) resolves to the R-SDK engine and so passes the cap,
+     * but is deliberately absent here: highlight has never been confirmed on
+     * one. Add it once someone tests it — do not assume it from the family.
+     */
+    if (!camera_engine_slot_has_cap(slot_index, CAM_CAP_HIGHLIGHT)) {
+        return false;
+    }
+
     extern camera_state_t g_camera_states[NUM_CAMERAS];
     uint32_t device_id = g_camera_states[slot_index].device_id;
     if (device_id == 0) {
         return false;
     }
-    if (device_id == 0xFF33 || device_id == 0xFF44 || device_id == 0xFF55) {
+    if (device_id == RSDK_DEVICE_ID_ACTION4 ||
+        device_id == RSDK_DEVICE_ID_ACTION5 ||
+        device_id == RSDK_DEVICE_ID_ACTION6) {
         return true;
     }
     return false;

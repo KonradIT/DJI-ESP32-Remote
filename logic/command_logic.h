@@ -42,8 +42,6 @@ esp_err_t duml_write_tracked(int camera_index, uint8_t dst, uint8_t cmd_set, uin
 CommandResult send_command(int camera_index, uint8_t dst, uint8_t cmd_set, uint8_t cmd_id,
                            const uint8_t *payload, size_t payload_len, uint16_t seq, int timeout_ms);
 
-camera_mode_switch_response_frame_t* command_logic_switch_camera_mode(int camera_index, camera_mode_t mode);
-
 version_query_response_frame_t* command_logic_get_version(int camera_index);
 
 record_control_response_frame_t* command_logic_start_record(int camera_index);
@@ -57,6 +55,10 @@ esp_err_t command_logic_take_photo(int camera_index);
 /* Mode-aware capture: shoots in photo mode, starts recording otherwise. */
 esp_err_t command_logic_shutter_async(int camera_index);
 
+/* Advance to the next shooting mode, via whichever means this slot's engine
+ * uses (R-SDK QS key report vs. a media table lookup + 0x02/0xE1). */
+esp_err_t command_logic_mode_cycle_async(int camera_index);
+
 /* Set the shooting mode (osmo_mode_t) via 0x02/0xE1. The camera echoes it back
  * in its status push, so g_camera_states[].shoot_mode follows automatically. */
 esp_err_t command_logic_set_shoot_mode(int camera_index, uint8_t mode);
@@ -69,8 +71,6 @@ esp_err_t command_logic_set_iso_limit(int camera_index, osmo_iso_limit_t iso);
 
 /* Parameter sweeps and other RE probes live in tools/re/, not in the firmware. */
 
-
-key_report_response_frame_t* command_logic_key_report_qs(int camera_index);
 
 camera_power_mode_switch_response_frame_t* command_logic_power_mode_switch_sleep(int camera_index);
 camera_power_mode_switch_response_frame_t* command_logic_power_mode_switch_wake(int camera_index);
@@ -89,5 +89,11 @@ bool command_logic_slot_is_awake(int slot_index);
 bool command_logic_slot_is_recording(int slot_index);
 esp_err_t command_logic_send_highlight_for_slot(int slot_index);
 esp_err_t command_logic_send_highlight_for_all_active(void);
+
+/* Raw DUML record control — the media engine's implementation. Call the
+ * engine (or command_logic_*_record_async) instead; these do not dispatch,
+ * and routing them through the engine would recurse. */
+esp_err_t media_record_start_raw(int camera_index);
+esp_err_t media_record_stop_raw(int camera_index);
 
 #endif

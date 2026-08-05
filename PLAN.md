@@ -29,17 +29,75 @@ the source of the R-SDK implementation.
   branch dropped this** (`(void)device_id;`), which is why the highlight gate
   (`0xFF33/44/55`) never fires and the Tag button never appears on a Nano.
 
-### Resolution rules (no fallback)
+### Engine assignment — positive identification both ways, no fallback
 
-1. `adv_model_id == 0x0019` → **MEDIA**. Pin at pairing, persist with the pairing.
-2. Advert carries DJI mfg data with any other model id → **RSDK**; confirm the
-   model from the connection result's `device_id` after connecting.
-3. **Pocket 3 exception** — reportedly advertises *no* manufacturer data, so it
-   is pinned by advertised **name**. This is the one name-based route and is
-   documented as such. ⚠ **Test this before relying on it** — the claim is
-   unverified and we expect to find adv data.
-4. Anything else → **UNKNOWN**: refuse to connect and say so in the UI. No
-   default backend.
+Each camera is assigned an **engine** at pairing. Both routes are positive
+identifications; neither is a default.
+
+1. **Advert says Media.** `adv_model_id == 0x0019` (Nano) → **MEDIA engine**.
+   Decided before connecting; never send the R-SDK handshake to it.
+2. **Pocket 3 exception** — reportedly sends no mfg data, so pinned by advertised
+   **name** → MEDIA. The one name-based route. ⚠ Verify the no-mfg-data claim.
+3. **Otherwise, ask.** Send the R-SDK Connection Request (`0x00/0x19`). If the
+   camera answers with a `device_id` in `{0xFF33, 0xFF44, 0xFF55, 0xFF66}` →
+   **RSDK engine**, and we have the exact model for free.
+4. **No answer, or an unrecognised id** → **UNKNOWN**: refuse, and say so.
+
+This is better than an adv-model-id table for the Action family, because the
+R-SDK handshake *self-identifies* — we never need a complete catalogue of
+`0x0014/0x0015/0x0018/...`, which we could not verify anyway.
+
+---
+
+## 1b. The engine interface
+
+The UI and logic consume **only** this; neither protocol's symbols appear above
+the seam (that is B5).
+
+```c
+typedef enum { CAM_MODE_VIDEO, CAM_MODE_PHOTO, CAM_MODE_TIMELAPSE,
+               CAM_MODE_SLOWMO, CAM_MODE_HYPERLAPSE, CAM_MODE_SUPERNIGHT } cam_mode_t;
+
+typedef struct camera_engine {
+    const char *name;                                   /* "rsdk" | "media" */
+
+    esp_err_t (*connect)(int slot);
+    esp_err_t (*disconnect)(int slot);
+
+    esp_err_t (*record_start)(int slot);                /* INTENT, never a byte */
+    esp_err_t (*record_stop)(int slot);
+    esp_err_t (*shoot_photo)(int slot);
+    esp_err_t (*set_mode)(int slot, cam_mode_t mode);
+
+    void      (*on_frame)(int slot, const uint8_t *f, size_t len);  /* fills camera_state_t */
+
+    uint32_t  caps;   /* CAP_GPS | CAP_HIGHLIGHT | CAP_SLEEP | CAP_EIS | CAP_PHOTO_SIZE */
+} camera_engine_t;
+```
+
+`camera_state_t` gains `const camera_engine_t *engine;`. Every `command_logic_*`
+entry point becomes `state->engine->record_start(slot)` etc. Capability queries
+replace the `device_id == 0xFF33 || ...` special-casing that exists today.
+
+**`record_start` / `record_stop` are separate methods on purpose.** The wire byte
+is inverted between protocols (R-SDK `0`=start, Media `[01]`=start); an interface
+taking a direction byte would silently invert on one engine.
+
+### ⚠ The engine split is NOT the frame split
+
+Evidence from the 3-camera test: an **Action camera emits both framings on one
+link**. It sends `0x55` DUML status that this branch already decodes (mode,
+video settings, battery, recording) *and* answers `0xAA` R-SDK frames, which is
+what `main` talks. So:
+
+- **Receive path dispatches on the SOF byte** — `0x55` → DUML decode,
+  `0xAA` → R-SDK decode — *not* on the slot's engine. Both can arrive from the
+  same camera.
+- **Commands dispatch on the slot's engine.**
+
+⚠ `main:protocol/dji_protocol_parser.c` **documents SOF as `0x55` (lines 12, 55)
+but checks `0xAA` (line 137)**. The code is correct; the comment is not. Fix the
+comment when restoring, before it misleads someone.
 
 ---
 
@@ -84,6 +142,7 @@ status subscribe `0x1D/0x05`.
 | B2 | **Stage 0 is not independent of the ble.c work.** `main`'s advert filter requires `mfg[4] == 0xFA`, which the Nano does not set — so on pristine `main` the Nano is rejected *before* `adv_model_id` is computed. | `main:ble/ble.c:193` and `:204` |
 | B3 | **`ble_register_notify()` is shared and unconditional** — dual-CCCD subscribe + the `01 00` arm write to `0xFFF4` fire for every camera. It is called from `connect_logic.c` before any command-layer dispatch, so a seam in `command_logic_*` does not cover it. | `ble.c` register path; `connect_logic.c:332,427` |
 | B4 | **`data/data.c` can only exist once** — it owns the single global BLE notify callback and discards any frame not starting `0x55`. It cannot be "restored from main" *and* have a DUML twin. | `data.c:1097`, single `ble_set_notify_callback()` |
+| B6 | **The command-response table is not keyed by camera.** `entry_t` (`data.c:89`) holds `seq` / `cmd_set` / `cmd_id` but **no `camera_index`**, and `s_entries[]` is one global array for all slots. `find_entry_by_cmd_id(cmd_set, cmd_id)` therefore returns the same entry whichever camera answered — with 3 cameras pushing identical cmd ids, a response can be handed to the wrong slot's waiter. Add `camera_index` to the key. | `data.c:89-124`, `:264`, `:772` |
 | B5 | **UI reaches past the seam into DUML directly** — `ui_screen_main.c`, `ui_screen_mode_switch.c`, `ui.c` call `osmo_mode_name()`, `OSMO_MODE_PHOTO`, `osmo_photo_size_name()`. With a mixed fleet these render DUML names for R-SDK cameras. | `ui_screen_mode_switch.c:15,185,197,201`; `ui_screen_main.c:428-441`; `ui.c:2588` |
 
 **Shared-struct hazards** (`camera_state_t`, silent corruption not compile errors):
@@ -117,7 +176,12 @@ noted, verify on hardware before proceeding.
 - Add `adv_model_id` to `camera_state_t`, distinct from `device_id`; merge advert
   records per MAC so the mfg-bearing one wins (the Nano emits two records under
   one MAC and only `DJI Camera` carries mfg data).
-- Persist `adv_model_id` with the NVS pairing.
+- Persist `adv_model_id` with the NVS pairing. **Not optional** — the boot scan
+  stops on the first MAC match, so the mfg-bearing record is frequently never
+  seen and the id reads 0. A smoke test on 2026-08-05 caught exactly this: the
+  Nano fell to UNRESOLVED on `adv 0x0000`. Treat 0 as "not observed this boot"
+  and fall back to the stored value; grant a short extra listening window
+  (`BOOT_SCAN_ID_WAIT_MS`) only when a found slot still has no id at all.
 - Add `cam_backend_t { RSDK, MEDIA, UNKNOWN }` and the resolution rules above.
   UNKNOWN refuses to connect.
 - Restore `device_id` assignment from the R-SDK connection result.
@@ -136,21 +200,23 @@ noted, verify on hardware before proceeding.
   as part of the move, not later.
 - The DUML command/status implementations become `mediaprotocol/*_media.c`.
 
-### Stage 3 — Dispatch seam
-- Per-slot backend resolved once, at pairing.
-- Public `command_logic_*` API unchanged; each entry point dispatches.
-- **Intent-based, not byte-based** — `RECORD_START`/`RECORD_STOP`, never a raw
-  direction byte (see the inversion above).
-- Extend the seam **below** command_logic: `ble_register_notify()` gains backend
-  awareness so R-SDK cameras don't get the Nano's arm/dual-CCCD sequence — **B3**.
+### Stage 3 — The engine interface
+- Define `camera_engine_t` (§1b); add `engine` to `camera_state_t`.
+- Implement `media_engine` (wrap the existing DUML calls) and `rsdk_engine`
+  (wrap the restored R-SDK calls).
+- Assign the engine at pairing per §1's rules; UNKNOWN refuses.
+- Rewrite `command_logic_*` entry points as one-line delegations.
 - Delete/fix `command_logic_switch_camera_mode()`.
+- `ble_register_notify()` may stay shared — hardware-confirmed tolerated by
+  Action bodies (**B3** downgraded). Scope it per engine later if desired.
 
 ### Stage 4 — Receive path
-- `data/data.c` is rewritten as a **new dispatcher** — not a restore of either
-  version — **B4**. Per-slot: `0x55` → DUML parse, `0xAA` → R-SDK parse.
-- Keep the existing seq/cmd-id matching table; it is already protocol-agnostic.
-- Each backend fills the shared `camera_state_t`; add per-backend "field is live"
-  discipline so dead fields aren't read as data.
+- `data/data.c` becomes a **new dispatcher** — not a restore of either version
+  — **B4**. Dispatch on the **SOF byte**: `0x55` → DUML decode, `0xAA` → R-SDK
+  decode. *Not* on the slot's engine: an Action camera sends both (§1b).
+- **Add `camera_index` to `entry_t`'s key** — **B6**.
+- Each decoder fills the shared `camera_state_t`; add per-field "is live for this
+  engine" discipline so dead fields aren't read as data.
 
 ### Stage 5 — Commands and fan-out
 - "All cameras" paths iterate slots and dispatch per backend.
@@ -179,8 +245,55 @@ media path uses **Write Without Response** — the Nano's `0xFFF5` is
 have not been checked.
 
 None of this is answerable by reading code. **Put an Action 4/5/6 on the current
-branch's `ble.c` and see what happens.** If it connects and records, `ble/` stays
-shared and this is the 7-stage job above. If it doesn't, Stage 3 grows a
-per-backend transport profile and the estimate roughly doubles.
+branch's `ble.c` and see what happens.**
 
-Do that test **before** Stage 1.
+### ✅ RESULT — tested 2026-08-01 with OA5 + OA6 + Nano on this branch
+
+**`ble/` stays shared. B3 is downgraded from BLOCKER to MINOR.** All three
+cameras connect and stream live status — correct storage, battery, recording
+state and record timer, with updates. So the dual-CCCD subscribe, the `01 00`
+arm write to `0xFFF4`, MTU 500, the 20 s supervision floor and SM/bonding
+enabled are all **tolerated by Action-series bodies**. The transport does not
+need a per-backend profile, and the estimate does not double.
+
+Still worth scoping `ble_register_notify()` per backend eventually (an Action
+does not *need* the Nano's arm sequence), but it is now an optimisation, not a
+prerequisite.
+
+**Record start/stop fails on OA5/OA6 — expected, not a finding.** This branch
+has no R-SDK command layer, so the shutter sends DUML `0x02/0x02` to a camera
+that does not speak it. Stages 1-3 are exactly what fixes this.
+
+### ✅ RESULT — tested 2026-08-05 with a Nano on the engine build
+
+The whole media path is verified through the engine interface: **take photo,
+start/stop recording, mode cycling, and status (battery, SD, is-recording,
+record seconds, mode, resolution)**. Engine resolution survives reboots via the
+`adv_model_id` stored with the pairing.
+
+Not yet retested with OA5/OA6 — that needs the tester. Everything R-SDK in this
+branch is therefore **written but unproven on hardware**, including
+`rsdk_probe_identity()`, the R-SDK record/photo/mode frames, and the GPS,
+highlight and sleep capability gates.
+
+### ⚠ Two anomalies the test exposed — investigate before Stage 1
+
+1. **Action-series status is being decoded by the DUML path.** `data.c:1097`
+   drops any frame whose first byte is not `0x55`, yet OA5/OA6 storage, battery,
+   recording bit and record timer all decode correctly. Either Action bodies
+   emit DUML `0x55` status pushes (likely — DUML is the underlying DJI transport
+   and "R-SDK" is a documented layer over it), or something else is going on.
+   **This materially affects the plan**: if Action cameras already speak DUML
+   status, Stage 4's receive dispatcher may only need R-SDK for *command
+   responses*, not for status at all. Verify with a capture before designing it.
+
+2. **Slot attribution bug.** With OA5 in slot 1 and OA6 in slot 2, recording
+   started manually on the **OA6** renders its icon and timer on **slot 1**. The
+   UI maps blocks per index correctly (`&s_cam[idx]` / `&g_camera_states[idx]`),
+   so frames are being attributed to the wrong slot upstream — in the notify →
+   `camera_index` path. This is a live bug on the current branch, independent of
+   the refactor, and would silently corrupt any mixed-fleet work built on top of
+   it. Fix before Stage 1.
+
+3. **OA5 takes a long time to be discovered.** Lower priority; may be advertising
+   interval, or the scan filter now that `mfg[4] == 0xFA` is gone.

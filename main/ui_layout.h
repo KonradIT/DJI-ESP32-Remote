@@ -131,6 +131,8 @@ static inline lv_color_t ui_clr_blue(void)   { return lv_color_make(  0,   0, 25
 static inline lv_color_t ui_clr_yellow(void) { return lv_color_make(255, 255,   0); }
 static inline lv_color_t ui_clr_orange(void) { return lv_color_make(255, 165,   0); }
 static inline lv_color_t ui_clr_cyan(void)   { return lv_color_make(  0, 255, 255); }
+/* Dimmed foreground — an item present but unavailable on this camera. */
+static inline lv_color_t ui_clr_gray(void)   { return lv_color_make(110, 110, 110); }
 
 /* ======================================================================
  * Shared LVGL Widget Helpers

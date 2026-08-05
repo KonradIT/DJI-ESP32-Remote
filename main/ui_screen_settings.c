@@ -9,6 +9,7 @@
 #include "ui_screen_settings.h"
 #include "ui.h"
 #include "ui_layout.h"
+#include "camera_engine.h"
 #include "lvgl_icons.h"
 #include "esp_log.h"
 #include <string.h>
@@ -207,16 +208,28 @@ void ui_screen_settings_update(void) {
 
     const camera_state_t *cam = &g_camera_states[s_camera_index];
 
-    /* Entry 2: Sleep/Wakeup */
+    /* Entry 2: Sleep/Wakeup
+     *
+     * Dimmed rather than removed when the engine has no sleep command: the
+     * selection cursor indexes this list positionally (SETTINGS_ITEM_*), so
+     * dropping a row would silently renumber every entry below it. Greying
+     * shows the camera lacks the feature without rewiring the menu. Waking is
+     * always offered — it is a BLE advertisement, not an engine command. */
+    bool dim_sleep_row = false;
     if (s_entry_count > 2) {
         bool is_sleeping = (cam->power_mode == 3) || cam->is_sleeping;
+        bool can_sleep   = camera_engine_slot_has_cap(s_camera_index, CAM_CAP_SLEEP);
+        dim_sleep_row = !is_sleeping && !can_sleep;
+
         if (is_sleeping) {
             lv_image_set_src(s_entries[2].icon, &lvgl_wakeup_icon);
             lv_label_set_text(s_entries[2].label, "Wakeup");
         } else {
             lv_image_set_src(s_entries[2].icon, &lvgl_sleep_icon);
-            lv_label_set_text(s_entries[2].label, "Sleep");
+            lv_label_set_text(s_entries[2].label, can_sleep ? "Sleep" : "Sleep n/a");
         }
+        lv_obj_set_style_text_color(s_entries[2].label,
+                                    dim_sleep_row ? ui_clr_gray() : ui_clr_white(), 0);
     }
 
     /* Entry 3: Connect/Disconnect */
@@ -243,6 +256,10 @@ void ui_screen_settings_update(void) {
 
     for (int i = 0; i < s_entry_count; i++) {
         ui_style_img_recolor(s_entries[i].icon, ui_clr_white());
+    }
+    /* After the blanket white pass, or it would undo the dim. */
+    if (dim_sleep_row) {
+        ui_style_img_recolor(s_entries[2].icon, ui_clr_gray());
     }
 
     /* Selection indicators */

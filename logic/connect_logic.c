@@ -45,6 +45,7 @@
 #include "enums_logic.h"
 #include "connect_logic.h"
 #include "command_logic.h"
+#include "camera_engine.h"
 #include "status_logic.h"
 #include "../main/ui.h"  // For camera_state_t and g_camera_states
 
@@ -502,10 +503,59 @@ int connect_logic_protocol_connect(int camera_index, uint32_t device_id, uint8_t
     if (camera_index < 0 || camera_index >= NUM_CAMERAS) {
         return -1;
     }
-    ESP_LOGI(TAG, "Camera %d: starting Osmo Nano DUML session", camera_index);
-
     /* Identify the camera from its BLE advertised name (OsmoNano-XXXX). */
     const char *dev_name = ble_get_connected_device_name(camera_index);
+
+    /*
+     * ENGINE ASSIGNMENT — decide which protocol this body speaks, before
+     * sending it anything. Route 1/2 (advertisement) resolve without asking;
+     * anything else needs the R-SDK connection request to self-identify.
+     *
+     * Sending the wrong protocol's frames does not fail loudly — the camera
+     * ignores them while still streaming status, so the remote looks connected
+     * and simply does nothing. Hence: never default.
+     */
+    /*
+     * The id may come from this boot's scan or from the pairing stored in NVS.
+     * Prefer whatever the air just gave us, but NEVER let a scan that missed
+     * the manufacturer record erase a known-good stored id: the boot scan stops
+     * as soon as the MAC matches, and a Nano alternates a name-only record with
+     * the mfg-bearing one, so seeing 0 here is routine and means "not observed",
+     * not "no id". This is still positive identification — the id was read off
+     * this camera's own advertisement, just on an earlier scan.
+     */
+    uint32_t scanned_id = ble_get_adv_model_id(camera_index);
+    uint32_t adv_id     = scanned_id ? scanned_id
+                                     : g_camera_states[camera_index].adv_model_id;
+
+    if (scanned_id != 0 && scanned_id != g_camera_states[camera_index].adv_model_id) {
+        g_camera_states[camera_index].adv_model_id = scanned_id;
+        save_all_cameras_to_nvs();   /* learn it once, survive the next boot */
+        ESP_LOGI(TAG, "Camera %d: stored advertised model id 0x%04X",
+                 camera_index, (unsigned int)scanned_id);
+    }
+
+    g_camera_states[camera_index].engine = camera_engine_from_advert(adv_id, dev_name);
+
+    if (g_camera_states[camera_index].engine == &g_engine_media) {
+        ESP_LOGI(TAG, "Camera %d: engine=media (adv model id 0x%04X, %s)",
+                 camera_index, (unsigned int)adv_id,
+                 scanned_id ? "this scan" : "stored at pairing");
+    } else {
+        /*
+         * Not a known media body. Most likely Action-family — which identifies
+         * itself in the reply to the R-SDK connection request (0x00/0x19). The
+         * probe runs after the link is up, further down; until it answers the
+         * slot stays unresolved and commands refuse, which is the intended
+         * failure mode, NOT a silent fallback to DUML.
+         */
+        ESP_LOGI(TAG, "Camera %d: not a known media body (adv 0x%04X, '%s') — "
+                      "will ask via R-SDK connection request",
+                 camera_index, (unsigned int)adv_id, dev_name ? dev_name : "?");
+    }
+
+    ESP_LOGI(TAG, "Camera %d: starting DUML session", camera_index);
+
     if (dev_name && dev_name[0] != '\0') {
         strncpy(g_camera_states[camera_index].model_name, dev_name,
                 sizeof(g_camera_states[camera_index].model_name) - 1);
@@ -626,6 +676,39 @@ int connect_logic_protocol_connect(int camera_index, uint32_t device_id, uint8_t
     s_slot_is_connecting[camera_index] = false;
 
     ESP_LOGI(TAG, "Camera %d: DUML session established (paired=%d)", camera_index, paired);
+
+    /*
+     * Engine route 3 — ask an unidentified body who it is.
+     *
+     * Deliberately AFTER the DUML bring-up, not instead of it: an Action camera
+     * answers the DUML session and then streams 0x02/0x80 status we already
+     * decode (storage, battery, recording, timer — hardware-confirmed with an
+     * OA5 and OA6). Skipping the DUML handshake for non-media bodies would
+     * throw that away. The two protocols coexist on one link; only the command
+     * vocabulary differs.
+     */
+    if (g_camera_states[camera_index].engine == NULL) {
+        uint32_t rsdk_id = 0;
+        if (rsdk_probe_identity(camera_index, &rsdk_id) == ESP_OK) {
+            const camera_engine_t *e = camera_engine_from_rsdk_device_id(rsdk_id);
+            if (e != NULL) {
+                g_camera_states[camera_index].engine = e;
+                g_camera_states[camera_index].device_id = rsdk_id;
+                const char *model = ui_get_camera_model_name(rsdk_id);
+                strncpy(g_camera_states[camera_index].model_name, model,
+                        sizeof(g_camera_states[camera_index].model_name) - 1);
+                g_camera_states[camera_index].model_name[
+                    sizeof(g_camera_states[camera_index].model_name) - 1] = '\0';
+                ESP_LOGI(TAG, "Camera %d: engine=rsdk (%s, device_id 0x%04X)",
+                         camera_index, model, (unsigned int)rsdk_id);
+            }
+        }
+        if (g_camera_states[camera_index].engine == NULL) {
+            ESP_LOGW(TAG, "Camera %d: engine UNRESOLVED — commands will refuse. "
+                          "Neither a known media advert nor an R-SDK identity.",
+                     camera_index);
+        }
+    }
 
     esp_err_t save_err = save_all_cameras_to_nvs();
     if (save_err != ESP_OK) {
@@ -833,6 +916,9 @@ int connect_logic_start_boot_scan(void) {
         if (s_boot_scan_slot_pending[i]) {
             // Set target device info in BLE profile for this slot
             ble_set_target_device(i, g_camera_states[i].camera_name, g_camera_states[i].camera_mac);
+            /* Hand back the id stored with the pairing so the scan doesn't have
+             * to re-learn what we already know about this camera. */
+            ble_set_adv_model_id(i, g_camera_states[i].adv_model_id);
             ESP_LOGI(TAG, "Boot scan: Set target for slot %d: %s, MAC: %02X:%02X:%02X:%02X:%02X:%02X",
                      i, g_camera_states[i].camera_name,
                      g_camera_states[i].camera_mac[0], g_camera_states[i].camera_mac[1],

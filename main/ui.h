@@ -83,6 +83,13 @@ typedef struct camera_state_s {
     char camera_name[64];
     uint8_t camera_mac[6];
     uint32_t device_id;
+    /* Advertised model id (DJI mfg data, mfg[2..3] LE). 0x0019 = Osmo Nano.
+     * Distinct from device_id above, which is the R-SDK connection-request
+     * identity (0xFF33/44/55/66) and only exists after connecting. */
+    uint32_t adv_model_id;
+    /* Which protocol this body speaks. NULL = unresolved; commands must refuse
+     * rather than pick one. See logic/camera_engine.h. */
+    const struct camera_engine *engine;
     uint8_t mac_addr_len;
     int8_t mac_addr[6];
     uint32_t fw_version;

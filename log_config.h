@@ -48,7 +48,7 @@ typedef enum {
  * pairing trace and the DEBUG_DUML_PACKETS frame dumps are logged at — so build
  * with -DAPP_DEFAULT_LOG_LEVEL=APP_LOG_LEVEL_INFO alongside
  * -DDEBUG_DUML_PACKETS=1 (see platformio.ini). */
-#define APP_DEFAULT_LOG_LEVEL APP_LOG_LEVEL_ERROR
+#define APP_DEFAULT_LOG_LEVEL APP_LOG_LEVEL_INFO   /* TEMP */
 #endif
 
 /**

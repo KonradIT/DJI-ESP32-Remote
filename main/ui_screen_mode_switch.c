@@ -254,12 +254,14 @@ void ui_screen_mode_switch_button_a(void) {
         return;
     }
 
-    esp_err_t ret = command_logic_send_key_report_for_slot(
-        s_camera_index, 0x02, 0x01, 0x00);
+    /* The engine decides HOW to advance — this screen only asks that it does.
+     * Previously this sent the R-SDK QS key report unconditionally, which a
+     * media body ignores, so the mode button did nothing on a Nano. */
+    esp_err_t ret = command_logic_mode_cycle_async(s_camera_index);
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "QS command sent to camera %d", s_camera_index + 1);
+        ESP_LOGI(TAG, "Mode cycle sent to camera %d", s_camera_index + 1);
     } else {
-        ESP_LOGW(TAG, "QS command failed for camera %d: %s",
+        ESP_LOGW(TAG, "Mode cycle failed for camera %d: %s",
                  s_camera_index + 1, esp_err_to_name(ret));
     }
 }

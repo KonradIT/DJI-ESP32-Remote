@@ -108,6 +108,19 @@ typedef struct {
     // Length of parsed result
     size_t parse_result_length;
 
+    /*
+     * Which camera slot this entry belongs to.
+     *
+     * Without it the map is global across cameras, so a reply arriving from one
+     * body can satisfy a waiter registered by another — the waiter then returns
+     * the wrong camera's payload and reports success. Not reachable today via
+     * the seq path (generate_seq() is atomic and monotonic, so two in-flight
+     * entries never share a seq), but the cmd_set/cmd_id path has no such
+     * protection: two connected cameras both send 0x07/0x46 during pairing and
+     * whichever arrives first claims the entry.
+     */
+    int camera_index;
+
     // For synchronous waiting
     SemaphoreHandle_t sem;
 
@@ -221,6 +234,7 @@ static void reset_entries(void) {
     for (int i = 0; i < MAX_SEQ_ENTRIES; i++) {
         s_entries[i].in_use = false;
         s_entries[i].is_seq_based = false;
+        s_entries[i].camera_index = -1;   /* unowned, matches no camera filter */
         s_entries[i].seq = 0;
         s_entries[i].cmd_set = 0;
         s_entries[i].cmd_id = 0;
@@ -244,8 +258,14 @@ static void reset_entries(void) {
  * @param seq Sequence number to find
  * @return entry_t* Pointer to found entry, NULL if not found
  */
-static entry_t* find_entry_by_seq(uint16_t seq) {
+/* camera_index < 0 means "any camera" — used where the key is already unique
+ * on its own (a seq from the atomic generator) or where the caller is sweeping
+ * for stale entries regardless of owner. */
+static entry_t* find_entry_by_seq(uint16_t seq, int camera_index) {
     for (int i = 0; i < MAX_SEQ_ENTRIES; i++) {
+        if (camera_index >= 0 && s_entries[i].camera_index != camera_index) {
+            continue;
+        }
         if (s_entries[i].in_use && s_entries[i].is_seq_based && s_entries[i].seq == seq) {
             s_entries[i].last_access_time = xTaskGetTickCount();
             return &s_entries[i];
@@ -261,9 +281,12 @@ static entry_t* find_entry_by_seq(uint16_t seq) {
  * @param cmd_id Command ID
  * @return entry_t* Pointer to found entry, NULL if not found
  */
-static entry_t* find_entry_by_cmd_id(uint16_t cmd_set, uint16_t cmd_id) {
+static entry_t* find_entry_by_cmd_id(uint16_t cmd_set, uint16_t cmd_id, int camera_index) {
     for (int i = 0; i < MAX_SEQ_ENTRIES; i++) {
-        if (s_entries[i].in_use && !s_entries[i].is_seq_based && 
+        if (camera_index >= 0 && s_entries[i].camera_index != camera_index) {
+            continue;
+        }
+        if (s_entries[i].in_use && !s_entries[i].is_seq_based &&
             s_entries[i].cmd_set == cmd_set && s_entries[i].cmd_id == cmd_id) {
             s_entries[i].last_access_time = xTaskGetTickCount();
             return &s_entries[i];
@@ -304,12 +327,12 @@ static void free_entry(entry_t *entry) {
  * @param seq Frame sequence number
  * @return entry_t* Pointer to allocated entry, NULL if failed
  */
-static entry_t* allocate_entry_by_seq(uint16_t seq) {
+static entry_t* allocate_entry_by_seq(uint16_t seq, int camera_index) {
     // First check if an entry with the same seq exists. Never reuse one that a
     // waiter is blocked on (awaiting) — freeing it would be a use-after-free.
     // With an atomic generate_seq() two in-flight entries cannot share a seq,
     // so a match here is a stale entry; the awaiting guard is defensive.
-    entry_t *existing_entry = find_entry_by_seq(seq);
+    entry_t *existing_entry = find_entry_by_seq(seq, -1);
     if (existing_entry && !existing_entry->awaiting) {
         ESP_LOGI(TAG, "Overwriting existing entry for seq=0x%04X", seq);
         free_entry(existing_entry);
@@ -325,6 +348,7 @@ static entry_t* allocate_entry_by_seq(uint16_t seq) {
         if (!s_entries[i].in_use) {
             s_entries[i].in_use = true;
             s_entries[i].is_seq_based = true;
+            s_entries[i].camera_index = camera_index;
             s_entries[i].seq = seq;
             s_entries[i].cmd_set = 0;
             s_entries[i].cmd_id = 0;
@@ -359,6 +383,7 @@ static entry_t* allocate_entry_by_seq(uint16_t seq) {
         // Reallocate
         oldest_entry->in_use = true;
         oldest_entry->is_seq_based = true;
+        oldest_entry->camera_index = camera_index;
         oldest_entry->seq = seq;
         oldest_entry->cmd_set = 0;
         oldest_entry->cmd_id = 0;
@@ -386,9 +411,11 @@ static entry_t* allocate_entry_by_seq(uint16_t seq) {
  * @param cmd_id Command ID
  * @return entry_t* Pointer to allocated entry, NULL if failed
  */
-static entry_t* allocate_entry_by_cmd(uint8_t cmd_set, uint8_t cmd_id) {
-    // First check if an entry with the same cmd_set and cmd_id exists
-    entry_t *existing_entry = find_entry_by_cmd_id(cmd_set, cmd_id);
+static entry_t* allocate_entry_by_cmd(uint8_t cmd_set, uint8_t cmd_id, int camera_index) {
+    /* Scoped to the owning camera: two connected bodies send the same
+     * cmd_set/cmd_id (0x07/0x46 during pairing), and a shared entry would let
+     * one camera's payload be handed to a waiter expecting the other's. */
+    entry_t *existing_entry = find_entry_by_cmd_id(cmd_set, cmd_id, camera_index);
     if (existing_entry) {
         // Entry exists, reuse it - free old parse_result to prevent memory leak
         ESP_LOGD(TAG, "Entry for cmd_set=0x%04X cmd_id=0x%04X already exists, reusing", cmd_set, cmd_id);
@@ -410,6 +437,7 @@ static entry_t* allocate_entry_by_cmd(uint8_t cmd_set, uint8_t cmd_id) {
             // Found a free entry
             s_entries[i].in_use = true;
             s_entries[i].is_seq_based = false;
+            s_entries[i].camera_index = camera_index;
             s_entries[i].seq = 0;
             s_entries[i].cmd_set = cmd_set;
             s_entries[i].cmd_id = cmd_id;
@@ -444,6 +472,7 @@ static entry_t* allocate_entry_by_cmd(uint8_t cmd_set, uint8_t cmd_id) {
         // Reallocate the deleted entry
         oldest_entry->in_use = true;
         oldest_entry->is_seq_based = false;
+        oldest_entry->camera_index = camera_index;
         oldest_entry->seq = 0;
         oldest_entry->cmd_set = cmd_set;
         oldest_entry->cmd_id = cmd_id;
@@ -587,7 +616,7 @@ esp_err_t data_write_with_response(int camera_index, uint16_t seq, const uint8_t
     }
 
     // Allocate an entry for this sequence
-    entry_t *entry = allocate_entry_by_seq(seq);
+    entry_t *entry = allocate_entry_by_seq(seq, camera_index);
     if (!entry) {
         ESP_LOGE(TAG, "No free entry, can't write");
         xSemaphoreGive(s_map_mutex);
@@ -674,8 +703,10 @@ esp_err_t data_wait_for_result_by_seq(uint16_t seq, int timeout_ms, void **out_r
             return ESP_ERR_INVALID_STATE;
         }
 
-        // Try to find entry
-        entry_t *entry = find_entry_by_seq(seq);
+        /* Any camera: the seq the caller holds came from the atomic generator
+         * and so identifies exactly one entry. The camera filter that matters
+         * is applied at dispatch, where the frame's origin is known. */
+        entry_t *entry = find_entry_by_seq(seq, -1);
 
         if (entry) {
             // Mark as awaiting so no allocator/cleanup can free this entry (and
@@ -768,8 +799,7 @@ esp_err_t data_wait_for_result_by_cmd(uint8_t cmd_set, uint8_t cmd_id, int timeo
             return ESP_ERR_INVALID_STATE;
         }
 
-        // Try to find entry
-        entry_t *entry = find_entry_by_cmd_id(cmd_set, cmd_id);
+        entry_t *entry = find_entry_by_cmd_id(cmd_set, cmd_id, -1);
 
         if (entry) {
             // Check if entry already has result
@@ -1016,7 +1046,9 @@ static void handle_duml_frame(int camera_index, duml_frame_t frame) {
         /* Response frame — find the waiter by seq */
         bool delivered = false;
         if (xSemaphoreTake(s_map_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            entry_t *entry = find_entry_by_seq(frame.seq);
+            /* Scoped to the camera the frame arrived on — a reply must only
+             * satisfy a waiter registered by that same slot. */
+            entry_t *entry = find_entry_by_seq(frame.seq, camera_index);
             if (entry) {
                 /* Empty acks are represented as one 0x00 status byte so
                  * waiters always receive a non-NULL result. */
@@ -1049,7 +1081,7 @@ static void handle_duml_frame(int camera_index, duml_frame_t frame) {
         /* Camera-originated request. Deliver to any cmd-based waiter first
          * (pairing approval 0x07/0x46 arrives as a request), then ack it. */
         if (xSemaphoreTake(s_map_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            entry_t *entry = allocate_entry_by_cmd(frame.cmd_set, frame.cmd_id);
+            entry_t *entry = allocate_entry_by_cmd(frame.cmd_set, frame.cmd_id, camera_index);
             if (entry) {
                 size_t result_len = frame.payload_len > 0 ? frame.payload_len : 1;
                 uint8_t *result = malloc(result_len);

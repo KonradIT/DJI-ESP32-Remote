@@ -39,7 +39,7 @@ extern "C" {
  * a new camera body).
  */
 #ifndef DEBUG_DUML_PACKETS
-#define DEBUG_DUML_PACKETS 0
+#define DEBUG_DUML_PACKETS 1   /* TEMP */
 #endif
 
 /* Flags (cmd_type byte) as seen on the BLE wire */

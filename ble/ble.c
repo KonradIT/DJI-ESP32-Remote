@@ -135,7 +135,25 @@ static bool s_ble_scan_active = false;
  * stragglers a short window and then get on with connecting.
  */
 #define BOOT_SCAN_GRACE_MS 5000
+
+/*
+ * Extra window granted when every slot has been found but one of them has not
+ * yet shown its manufacturer record, so we still have no model id for it.
+ *
+ * A Nano alternates two advertisement records — "OsmoNano-XXXX" (name only)
+ * and "DJI Camera" (carrying the id) — and the match above fires on whichever
+ * arrives first. Stopping the scan there loses the id half the time, and
+ * without it the slot gets no protocol engine at all. Much shorter than the
+ * straggler grace window because the two records alternate within a second;
+ * this is not a hunt, just a second look.
+ */
+#define BOOT_SCAN_ID_WAIT_MS 1500
+
 static esp_timer_handle_t s_boot_scan_grace_timer = NULL;
+
+/* Slots this boot scan was asked to find, kept because autoconnect_pending is
+ * cleared as each one is matched. */
+static bool s_boot_scan_slots[BLE_MAX_CAMERAS] = {false, false, false};
 
 /*
  * Must go through ble_stop_scan(), not ble_gap_disc_cancel(): cancelling
@@ -152,7 +170,7 @@ static void boot_scan_grace_cb(void *arg) {
     }
 }
 
-static void boot_scan_grace_arm(void) {
+static void boot_scan_grace_arm_ms(uint32_t delay_ms) {
     if (s_boot_scan_grace_timer == NULL) {
         const esp_timer_create_args_t args = {
             .callback = boot_scan_grace_cb,
@@ -165,7 +183,11 @@ static void boot_scan_grace_arm(void) {
     if (esp_timer_is_active(s_boot_scan_grace_timer)) {
         return;   /* already counting down from the first find */
     }
-    esp_timer_start_once(s_boot_scan_grace_timer, (uint64_t)BOOT_SCAN_GRACE_MS * 1000);
+    esp_timer_start_once(s_boot_scan_grace_timer, (uint64_t)delay_ms * 1000);
+}
+
+static void boot_scan_grace_arm(void) {
+    boot_scan_grace_arm_ms(BOOT_SCAN_GRACE_MS);
 }
 
 static void boot_scan_grace_cancel(void) {
@@ -667,6 +689,29 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
         uint32_t device_id       = get_dji_device_id(adv, adv_len);
         int8_t rssi              = event->disc.rssi;
 
+        /*
+         * Latch the advertised model id against whichever slot owns this MAC,
+         * for EVERY advertisement and independently of the scan mode.
+         *
+         * It cannot be done inside the per-mode match blocks below: the boot
+         * scan clears autoconnect_pending on the first matching record, and if
+         * that record happened to be the one WITHOUT manufacturer data (a Nano
+         * alternates "OsmoNano-XXXX" with "DJI Camera") the id would never be
+         * seen. Guarding on non-zero means the mfg-bearing record always wins,
+         * whichever order they arrive in.
+         */
+        if (device_id != 0) {
+            for (int i = 0; i < BLE_MAX_CAMERAS; i++) {
+                ble_profile_t *p = get_profile_by_camera_index(i);
+                if (p && memcmp(p->target_mac, bda_be, 6) == 0 &&
+                    p->adv_model_id != device_id) {
+                    p->adv_model_id = device_id;
+                    ESP_LOGI(TAG, "Slot %d: advertised model id 0x%04X",
+                             i, (unsigned int)device_id);
+                }
+            }
+        }
+
         ESP_LOGI(TAG, "Found device: %s RSSI=%d MAC=%02X:%02X:%02X:%02X:%02X:%02X "
                  "device_id=0x%04X mode=%d",
                  adv_name_str, rssi,
@@ -700,9 +745,30 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
                         }
                     }
                     if (all_resolved) {
-                        ESP_LOGI(TAG, "All autoconnect slots found, stopping scan early");
-                        boot_scan_grace_cancel();
-                        ble_gap_disc_cancel();
+                        /*
+                         * Found is not the same as identified. If a slot still
+                         * has no model id, give the alternating mfg record one
+                         * short window to arrive rather than connecting to a
+                         * camera we cannot assign an engine to.
+                         */
+                        int unidentified = -1;
+                        for (int j = 0; j < BLE_MAX_CAMERAS; j++) {
+                            ble_profile_t *pj = get_profile_by_camera_index(j);
+                            if (s_boot_scan_slots[j] && pj && pj->adv_model_id == 0) {
+                                unidentified = j;
+                                break;
+                            }
+                        }
+                        if (unidentified >= 0) {
+                            ESP_LOGI(TAG, "All slots found but slot %d has no model id yet, "
+                                          "listening %d ms more",
+                                     unidentified, BOOT_SCAN_ID_WAIT_MS);
+                            boot_scan_grace_arm_ms(BOOT_SCAN_ID_WAIT_MS);
+                        } else {
+                            ESP_LOGI(TAG, "All autoconnect slots found, stopping scan early");
+                            boot_scan_grace_cancel();
+                            ble_gap_disc_cancel();
+                        }
                     } else {
                         /* Some slot is still outstanding — it may simply be
                          * switched off, so don't burn the full timeout on it. */
@@ -1199,6 +1265,7 @@ scan_mode_t ble_get_scan_mode(void) {
 void ble_set_autoconnect_pending(bool pending[BLE_MAX_CAMERAS]) {
     for (int i = 0; i < BLE_MAX_CAMERAS; i++) {
         s_scan_controller.autoconnect_pending[i] = pending[i];
+        s_boot_scan_slots[i] = pending[i];
         if (pending[i]) {
             ESP_LOGI(TAG, "Slot %d marked for autoconnect", i);
         }
@@ -1842,4 +1909,27 @@ void ble_set_target_device(int camera_index, const char* name, const uint8_t* ma
     ESP_LOGI(TAG, "Camera %d target device set: %s, MAC: %02X:%02X:%02X:%02X:%02X:%02X",
              camera_index, name,
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+/*
+ * Advertised model id latched for this slot during scanning, or 0 if no DJI
+ * manufacturer advertisement was ever seen for its MAC. Used to pick the
+ * protocol engine BEFORE connecting — see logic/camera_engine.h.
+ */
+uint32_t ble_get_adv_model_id(int camera_index) {
+    ble_profile_t *p = get_profile_by_camera_index(camera_index);
+    return p ? p->adv_model_id : 0;
+}
+
+/*
+ * Seed the slot with a model id learned on an earlier run (restored from the
+ * stored pairing). Lets the boot scan skip its extra listening window for a
+ * camera whose id is already known, and never overwrites a fresher reading
+ * taken off the air this boot.
+ */
+void ble_set_adv_model_id(int camera_index, uint32_t model_id) {
+    ble_profile_t *p = get_profile_by_camera_index(camera_index);
+    if (p && model_id != 0 && p->adv_model_id == 0) {
+        p->adv_model_id = model_id;
+    }
 }
