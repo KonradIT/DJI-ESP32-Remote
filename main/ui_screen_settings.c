@@ -217,7 +217,7 @@ void ui_screen_settings_update(void) {
      * always offered — it is a BLE advertisement, not an engine command. */
     bool dim_sleep_row = false;
     if (s_entry_count > 2) {
-        bool is_sleeping = (cam->power_mode == 3) || cam->is_sleeping;
+        bool is_sleeping = camera_is_sleeping(cam);
         bool can_sleep   = camera_engine_slot_has_cap(s_camera_index, CAM_CAP_SLEEP);
         dim_sleep_row = !is_sleeping && !can_sleep;
 

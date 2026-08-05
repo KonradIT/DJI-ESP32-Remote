@@ -567,10 +567,8 @@ static void gps_transmission_task(void *pvParameters) {
         /* Push GPS data to all connected cameras using DJI protocol (CmdSet=0x00, CmdID=0x17) */
         int cameras_receiving_gps = 0;
         for (int cam_idx = 0; cam_idx < NUM_CAMERAS; cam_idx++) {
-            /* Sleep mode detection: When power_mode == 3, GPS updates must be stopped
-             * for that camera to avoid BLE write failures. GPS sending resumes automatically
-             * when camera wakes (power_mode != 3).
-             */
+            /* Sleep detection: a sleeping camera must not be sent GPS or the
+             * BLE writes fail; sending resumes automatically on wake. */
             /*
              * GPS push is an R-SDK frame (0xAA framing, 0x00/0x17). A media
              * body has no equivalent and simply drops it — so without this cap

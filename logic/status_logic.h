@@ -13,7 +13,6 @@ extern uint16_t current_record_time;
 extern uint32_t current_remain_capacity;
 extern uint32_t current_remain_time;
 extern uint8_t current_camera_bat_percentage;
-extern uint8_t current_power_mode;  // Sleep mode tracking: 0=normal, 3=sleep
 extern bool camera_status_initialized;
 extern uint32_t g_last_status_push_timestamp;  // Timestamp of last camera status push (in milliseconds)
 

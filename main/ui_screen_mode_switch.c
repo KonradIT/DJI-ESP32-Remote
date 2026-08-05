@@ -247,7 +247,7 @@ void ui_screen_mode_switch_button_a(void) {
         return;
     }
 
-    bool is_sleeping = (cam->power_mode == 3) || cam->is_sleeping;
+    bool is_sleeping = camera_is_sleeping(cam);
     if (is_sleeping) {
         ESP_LOGW(TAG, "Camera %d is sleeping", s_camera_index + 1);
         return;

@@ -151,6 +151,23 @@ typedef struct camera_state_s {
     char last_mode_param[21];
 } camera_state_t;
 
+/*
+ * Is this camera asleep? Single source of truth.
+ *
+ * A dozen call sites used to spell this out as
+ *     (cam->power_mode == 3) || cam->is_sleeping
+ * where 3 is the R-SDK power-mode code for sleeping. That first clause is
+ * DEAD: nothing writes camera_state_t.power_mode on any path, for either
+ * engine, so is_sleeping has always been carrying the result on its own. It
+ * survived because the `||` made it harmless.
+ *
+ * If a body ever does start reporting power_mode, add the test HERE — that is
+ * the point of having one definition instead of twelve.
+ */
+static inline bool camera_is_sleeping(const camera_state_t *cam) {
+    return cam != NULL && cam->is_sleeping;
+}
+
 // Global camera states array
 extern camera_state_t g_camera_states[NUM_CAMERAS];
 

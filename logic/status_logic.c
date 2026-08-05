@@ -44,7 +44,6 @@ uint16_t current_timelapse_interval = 0;
 uint32_t current_remain_capacity = 0;
 uint32_t current_remain_time = 0;
 uint8_t current_camera_bat_percentage = 0;
-uint8_t current_power_mode = 0;  // Sleep mode tracking: 0=normal, 3=sleep
 bool camera_status_initialized = false;
 uint32_t g_last_status_push_timestamp = 0;  // Timestamp of last camera status push (milliseconds)
 

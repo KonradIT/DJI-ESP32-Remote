@@ -413,7 +413,9 @@ bool command_logic_slot_is_awake(int slot_index) {
         return false;
     }
     extern camera_state_t g_camera_states[NUM_CAMERAS];
-    return g_camera_states[slot_index].power_mode != 3;
+    /* Was `power_mode != 3`, which nothing ever sets — so this reported every
+     * camera as awake, including one the UI was correctly showing as asleep. */
+    return !camera_is_sleeping(&g_camera_states[slot_index]);
 }
 
 bool command_logic_slot_is_recording(int slot_index) {

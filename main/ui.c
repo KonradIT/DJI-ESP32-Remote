@@ -1855,7 +1855,7 @@ static void ui_handle_settings_screen_button_a(void) {
         case SETTINGS_ITEM_SLEEP_WAKEUP: {
             ESP_LOGI(TAG, "Settings: Sleep/Wakeup selected");
 
-            bool is_sleeping = (cam->power_mode == 3) || cam->is_sleeping;
+            bool is_sleeping = camera_is_sleeping(cam);
 
             /* Only the sleep direction needs the cap — waking is a BLE
              * advertisement, not an R-SDK frame. See is_camera_sleep_candidate. */
@@ -2480,7 +2480,7 @@ void ui_screen_main(void) {
                 }
                 
                 // Check if camera is sleeping
-                bool is_sleeping = (cam_state->power_mode == 3) || cam_state->is_sleeping;
+                bool is_sleeping = camera_is_sleeping(cam_state);
                 
                 if (!is_sleeping) {
                     /* Awake — capture. In photo mode this shoots (0x02/0x01),
@@ -2501,7 +2501,7 @@ void ui_screen_main(void) {
                 }
                 
                 // Check if camera is sleeping
-                bool is_sleeping = (cam_state->power_mode == 3) || cam_state->is_sleeping;
+                bool is_sleeping = camera_is_sleeping(cam_state);
                 
                 if (is_sleeping) {
                     // Camera is sleeping - add to wake queue for snapshot mode
@@ -2582,7 +2582,7 @@ void ui_screen_main(void) {
     camera_state_t *cam_state = &g_camera_states[cam_idx];
     
     // Check if camera is in sleep mode (use per-camera state)
-    bool is_sleeping = (cam_state->power_mode == 3) || cam_state->is_sleeping;
+    bool is_sleeping = camera_is_sleeping(cam_state);
     
     if (is_sleeping) {
         // Camera is asleep - initiate snapshot mode
@@ -2714,25 +2714,23 @@ void ui_process_wake_and_record(void) {
             }
             break;
             
-        case WAKE_STATE_WAITING_CONFIRMATION:
-            // Check if camera has woken up (power_mode changed from 3 to 0)
-            if (current_power_mode != 3) {
-                // Camera is no longer in sleep mode
-                // Verify camera is actively communicating (status push is recent)
-                uint32_t status_age = current_time - g_last_status_push_timestamp;
-                
-                if (status_age < 1000) {
-                    // Status push is fresh (< 1 second old), camera is confirmed awake
-                    ESP_LOGI(TAG, "Camera wake confirmed (power_mode=%d, status_age=%lu ms), ready to send recording command",
-                             current_power_mode, status_age);
-                    g_wake_state = WAKE_STATE_READY;
-                } else {
-                    // Status push is stale, keep waiting
-                    ESP_LOGD(TAG, "Camera reports awake but status push is stale (%lu ms), waiting for fresh status",
-                             status_age);
-                }
+        case WAKE_STATE_WAITING_CONFIRMATION: {
+            /* A camera that is pushing status right now is awake — that is the
+             * whole test. This used to be guarded by `current_power_mode != 3`,
+             * a global nothing ever assigned, so the guard was always true and
+             * the status-freshness check below was already deciding this alone.
+             * The log even printed power_mode=0 every time. */
+            uint32_t status_age = current_time - g_last_status_push_timestamp;
+
+            if (status_age < 1000) {
+                ESP_LOGI(TAG, "Camera wake confirmed (status_age=%lu ms), ready to send recording command",
+                         status_age);
+                g_wake_state = WAKE_STATE_READY;
+            } else {
+                ESP_LOGD(TAG, "Waiting for a fresh status push to confirm wake (last was %lu ms ago)",
+                         status_age);
             }
-            
+            }
             // Check for timeout (6 seconds total: 3s broadcast + 3s confirmation)
             if (current_time - g_wake_broadcast_start_time >= 6000) {
                 ESP_LOGW(TAG, "Wake-and-record timeout (6s elapsed), camera did not respond");
@@ -2951,7 +2949,7 @@ void ui_process_wake_queue(void) {
                     }
                     
                     // Check if camera is sleeping
-                    bool is_sleeping = (cam_state->power_mode == 3) || cam_state->is_sleeping;
+                    bool is_sleeping = camera_is_sleeping(cam_state);
                     if (!is_sleeping) {
                         // Camera already awake - status_logic.c should have already sent snapshot key
                         // if snapshot_pending was true. Just clear and move on.
@@ -3002,7 +3000,7 @@ void ui_process_wake_queue(void) {
             // - Wake-only mode: snapshot_pending is always false, detect via power_mode only
             if (g_current_wake_camera_index >= 0) {
                 camera_state_t *cam_state = &g_camera_states[g_current_wake_camera_index];
-                bool is_still_sleeping = (cam_state->power_mode == 3) || cam_state->is_sleeping;
+                bool is_still_sleeping = camera_is_sleeping(cam_state);
                 
                 // Camera woke up if it's no longer sleeping
                 // For snapshot mode: snapshot_pending will have been cleared by status_logic.c
@@ -3042,7 +3040,7 @@ void ui_process_wake_queue(void) {
                 // Check if camera is still sleeping after timeout
                 if (g_current_wake_camera_index >= 0) {
                     camera_state_t *cam_state = &g_camera_states[g_current_wake_camera_index];
-                    bool is_still_sleeping = (cam_state->power_mode == 3) || cam_state->is_sleeping;
+                    bool is_still_sleeping = camera_is_sleeping(cam_state);
                     const uint8_t MAX_QUEUE_WAKE_RETRIES = 1;  // Allow 1 retry per camera in queue
                     
                     if (is_still_sleeping) {
@@ -3169,7 +3167,7 @@ void ui_process_single_camera_wake_timeout(void) {
         }
         
         // Check camera state
-        bool is_sleeping = (cam_state->power_mode == 3) || cam_state->is_sleeping;
+        bool is_sleeping = camera_is_sleeping(cam_state);
         bool is_connected = (cam_state->connection_state == CAM_STATE_CONNECTED) && cam_state->is_connected;
         
         if (!is_connected) {
