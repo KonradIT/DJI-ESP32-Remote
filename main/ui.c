@@ -1656,10 +1656,20 @@ static void ui_handle_pairing_screen_button_a(void) {
             strncpy(cam->camera_name, g_discovered_cameras[camera_idx].name, sizeof(cam->camera_name) - 1);
             cam->camera_name[sizeof(cam->camera_name) - 1] = '\0';
             memcpy(cam->camera_mac, g_discovered_cameras[camera_idx].mac, 6);
-            cam->device_id = g_discovered_cameras[camera_idx].device_id;
-            /* Keep the advertised model id in its own field too: device_id is
-             * overwritten by the R-SDK connection result on Action bodies, and
-             * this is the value the engine decision reads. */
+            /*
+             * The advertised model id goes ONLY into adv_model_id.
+             *
+             * It used to be copied into device_id as well, conflating two
+             * different id spaces: device_id is the R-SDK identity from the
+             * 0x00/0x19 connection result (0xFF33/44/55/66), while this is the
+             * advertisement's model code (0x0018 OA6, 0x0019 Nano, 0x0020
+             * Pocket 3). The overlap was harmless until the R-SDK engine
+             * started skipping its handshake when device_id looked already
+             * known — a slot that had never completed a connection request
+             * carried 0x0018 and looked identified, so the camera never
+             * registered us and never pushed status.
+             */
+            cam->device_id = 0;
             cam->adv_model_id = g_discovered_cameras[camera_idx].device_id;
             cam->connection_state = CAM_STATE_PAIRED_DISCONNECTED;
             cam->camera_reserved = active_slot;

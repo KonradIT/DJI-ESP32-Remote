@@ -182,7 +182,7 @@ void update_camera_state_handler(int camera_index, void *data) {
         /* @57 echoes the last 0x02/0xE1 written, so it tracks the mode whether
          * we set it or the user did it on the camera. */
         cam_mode_t pushed = (len > OSMO_STATUS_MODE)
-                                ? media_mode_from_wire(p[OSMO_STATUS_MODE])
+                                ? cam_mode_from_dji_wire(p[OSMO_STATUS_MODE])
                                 : CAM_MODE_UNKNOWN;
         if (len > OSMO_STATUS_MODE && cam->shoot_mode != pushed) {
             cam->shoot_mode = pushed;
@@ -297,8 +297,30 @@ void update_camera_state_handler(int camera_index, void *data) {
             }
         }
     } else {
-        ESP_LOGD(TAG, "Camera %d: unhandled status 0x%02X/0x%02X (%u B)",
-                 camera_index, blob->cmd_set, blob->cmd_id, len);
+        /*
+         * Report each unhandled (cmd_set, cmd_id) ONCE per camera, at INFO,
+         * with the head of its payload.
+         *
+         * At DEBUG this was invisible, and invisible is how an Action camera
+         * came to show battery and storage but no recording state: whatever
+         * carries its recording flag lands here and is dropped without trace.
+         * One line per opcode is cheap — a push repeating at 10 Hz still costs
+         * exactly one line — and the payload is what a decode gets written
+         * from, so this is also the A-B-A capture material.
+         */
+        static uint16_t seen[NUM_CAMERAS][12];
+        static uint8_t  seen_n[NUM_CAMERAS];
+        uint16_t key = ((uint16_t)blob->cmd_set << 8) | blob->cmd_id;
+        bool known = false;
+        for (uint8_t i = 0; i < seen_n[camera_index]; i++) {
+            if (seen[camera_index][i] == key) { known = true; break; }
+        }
+        if (!known && seen_n[camera_index] < 12) {
+            seen[camera_index][seen_n[camera_index]++] = key;
+            ESP_LOGI(TAG, "Camera %d: UNHANDLED push 0x%02X/0x%02X (%u B) — first sighting",
+                     camera_index, blob->cmd_set, blob->cmd_id, len);
+            ESP_LOG_BUFFER_HEX_LEVEL(TAG, p, len > 48 ? 48 : len, ESP_LOG_INFO);
+        }
     }
 
     if (!cam->is_initialized) {
@@ -313,6 +335,108 @@ void update_camera_state_handler(int camera_index, void *data) {
     }
 
     free(data);
+}
+
+/*
+ * Ingest an R-SDK 0x1D/0x02 camera status push (Action family, Osmo 360).
+ *
+ * This is the counterpart to the DUML 0x02/0x80 handler above, and the reason
+ * an Action camera previously showed battery but never a recording flag: its
+ * status arrives in 0xAA frames, which the receive path discarded wholesale
+ * before anything could decode them. Confirmed on an OA6 — it acknowledged
+ * 0x1D/0x03 with 00 and recorded, while the remote saw nothing come back.
+ *
+ * Writes the SAME camera_state_t fields as the media path, so the UI stays
+ * protocol-blind; only the wire layout differs.
+ */
+void update_camera_state_rsdk(int camera_index, const void *data, size_t len) {
+    if (!data || camera_index < 0 || camera_index >= NUM_CAMERAS) {
+        return;
+    }
+    if (len < sizeof(camera_status_push_command_frame)) {
+        ESP_LOGW(TAG, "Camera %d: 1D02 push too short (%u B, want %u)",
+                 camera_index, (unsigned)len,
+                 (unsigned)sizeof(camera_status_push_command_frame));
+        return;
+    }
+
+    const camera_status_push_command_frame *st =
+        (const camera_status_push_command_frame *)data;
+    camera_state_t *cam = &g_camera_states[camera_index];
+
+    g_last_status_push_timestamp = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    cam->last_status_timestamp = g_last_status_push_timestamp;
+    bool changed = false;
+
+    /* 0x03 = photo/video in progress, 0x05 = pre-recording. Both count as
+     * recording for the shutter's purposes — pre-record is already writing. */
+    bool rec = (st->camera_status == CAMERA_STATUS_PHOTO_OR_RECORDING ||
+                st->camera_status == CAMERA_STATUS_PRE_RECORDING);
+    if (cam->is_recording != rec) {
+        cam->is_recording = rec;
+        changed = true;
+        ESP_LOGI(TAG, "Camera %d: recording -> %s (1D02)", camera_index, rec ? "ON" : "OFF");
+    }
+    if (cam->camera_status != st->camera_status) {
+        cam->camera_status = st->camera_status;
+        changed = true;
+        if (camera_index == 0) current_camera_status = st->camera_status;
+    }
+
+    cam_mode_t mode = cam_mode_from_dji_wire(st->camera_mode);
+    if (cam->shoot_mode != mode) {
+        cam->shoot_mode = mode;
+        changed = true;
+        ESP_LOGI(TAG, "Camera %d: mode -> %s (1D02 wire 0x%02X)",
+                 camera_index, cam_mode_name(mode), st->camera_mode);
+    }
+
+    if (cam->record_time != st->record_time) {
+        cam->record_time = st->record_time;
+        changed = true;
+        if (camera_index == 0) current_record_time = st->record_time;
+    }
+    if (cam->remain_capacity != st->remain_capacity) {
+        cam->remain_capacity = st->remain_capacity;
+        changed = true;
+        if (camera_index == 0) current_remain_capacity = st->remain_capacity;
+    }
+    if (cam->remain_time != st->remain_time) {
+        cam->remain_time = st->remain_time;
+        changed = true;
+        if (camera_index == 0) current_remain_time = st->remain_time;
+    }
+    if (cam->video_resolution != st->video_resolution) {
+        cam->video_resolution = st->video_resolution;
+        changed = true;
+    }
+    if (cam->fps_idx != st->fps_idx) {
+        cam->fps_idx = st->fps_idx;
+        changed = true;
+    }
+    if (cam->eis_mode != st->eis_mode) {
+        cam->eis_mode = st->eis_mode;
+        changed = true;
+    }
+    if (st->camera_bat_percentage <= 100 &&
+        cam->battery_percentage != st->camera_bat_percentage) {
+        cam->battery_percentage = st->camera_bat_percentage;
+        changed = true;
+        ESP_LOGI(TAG, "Camera %d: battery -> %d%% (1D02)",
+                 camera_index, st->camera_bat_percentage);
+        if (camera_index == 0) current_camera_bat_percentage = st->camera_bat_percentage;
+    }
+
+    if (!cam->is_initialized) {
+        cam->is_initialized = true;
+        changed = true;
+        if (camera_index == 0) camera_status_initialized = true;
+        ESP_LOGI(TAG, "Camera %d status initialized (1D02)", camera_index);
+    }
+
+    if (changed) {
+        g_ui_state.display_needs_update = true;
+    }
 }
 
 void update_new_camera_state_handler(int camera_index, void *data) {

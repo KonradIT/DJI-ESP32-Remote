@@ -45,6 +45,10 @@
 #include "ble.h"
 #include "duml.h"
 #include "osmo_duml.h"
+/* R-SDK receive path — both framings share this link, so data.c decodes both. */
+#include "dji_protocol_parser.h"
+#include "dji_protocol_data_structures.h"
+#include "status_logic.h"
 
 /* Logging tag for ESP_LOG functions */
 #define TAG "DATA"
@@ -84,6 +88,12 @@
  * heap in flight rather than steady-state use.
  */
 #define NOTIFY_QUEUE_DEPTH 64
+
+/* R-SDK framing on the same link as DUML — see process_rsdk_frame(). */
+#define RSDK_SOF                    0xAA
+#define RSDK_CMDSET_CAMERA_STATUS   0x1D
+#define RSDK_CMDID_STATUS_PUSH      0x02   /* camera_status_push_command_frame */
+#define RSDK_CMDID_STATUS_PUSH_NEW  0x06   /* mode name/param strings          */
 
 /* Cleanup timer interval for expired entry removal
  * Runs every 60 seconds to clean up stale command entries
@@ -1167,6 +1177,95 @@ static void handle_duml_frame(int camera_index, duml_frame_t frame) {
     dispatch_status_blob(camera_index, &frame);
 }
 
+/*
+ * R-SDK (0xAA) frame — the other half of blocker B4.
+ *
+ * Action-family bodies answer commands and push 0x1D status in this framing.
+ * Everything here was previously discarded at the SOF check, which is why an
+ * OA6 recorded on request but the remote never learned that it had: the
+ * 0x1D/0x03 response AND the 0x1D/0x02 status both died before any decode.
+ *
+ * Ownership: protocol_parse_data() mallocs. If a waiter takes it, the entry
+ * owns it; otherwise this function frees it.
+ */
+static void process_rsdk_frame(int camera_index, const uint8_t *p, size_t len)
+{
+    protocol_frame_t frame;
+    if (protocol_parse_notification(p, len, &frame) != 0) {
+        ESP_LOGW(TAG, "cam%d: bad R-SDK frame (%u B)", camera_index, (unsigned)len);
+        return;
+    }
+    if (!frame.data || frame.data_length < 2) {
+        return;   /* no cmd_set/cmd_id to route on */
+    }
+
+    const uint8_t cmd_set = frame.data[0];
+    const uint8_t cmd_id  = frame.data[1];
+
+    size_t parsed_len = 0;
+    void  *parsed = protocol_parse_data(frame.data, frame.data_length,
+                                        frame.cmd_type, &parsed_len);
+    if (parsed == NULL) {
+        /* Descriptor table has no parser for this opcode. Report once so an
+         * unknown-but-present push is visible rather than silently ignored. */
+        static bool seen[DATA_MAX_CAMERAS][8];
+        static uint8_t seen_n[DATA_MAX_CAMERAS];
+        if (camera_index >= 0 && camera_index < DATA_MAX_CAMERAS &&
+            seen_n[camera_index] < 8) {
+            bool known = false;
+            for (uint8_t i = 0; i < seen_n[camera_index]; i++) {
+                if (seen[camera_index][i] == cmd_set) { known = true; break; }
+            }
+            if (!known) {
+                seen[camera_index][seen_n[camera_index]++] = cmd_set;
+                ESP_LOGI(TAG, "cam%d: R-SDK 0x%02X/0x%02X has no parser (%u B)",
+                         camera_index, cmd_set, cmd_id, (unsigned)frame.data_length);
+                /* Dump it: for a command we just sent, byte 2 is the return
+                 * code, and a refusal here is indistinguishable from silence
+                 * without seeing it. */
+                ESP_LOG_BUFFER_HEX_LEVEL(TAG, frame.data,
+                                         frame.data_length > 16 ? 16 : frame.data_length,
+                                         ESP_LOG_INFO);
+            }
+        }
+        return;
+    }
+
+    ESP_LOGI(TAG, "cam%d RSDK 0x%02X/0x%02X seq=0x%04X (%u B)",
+             camera_index, cmd_set, cmd_id, frame.seq, (unsigned)parsed_len);
+
+    /* Status pushes feed the UI. Done before the waiter hand-off because the
+     * handler only borrows the buffer. */
+    if (cmd_set == RSDK_CMDSET_CAMERA_STATUS) {
+        if (cmd_id == RSDK_CMDID_STATUS_PUSH) {
+            update_camera_state_rsdk(camera_index, parsed, parsed_len);
+        } else if (cmd_id == RSDK_CMDID_STATUS_PUSH_NEW && new_status_update_callback) {
+            void *copy = malloc(parsed_len);
+            if (copy) {
+                memcpy(copy, parsed, parsed_len);
+                new_status_update_callback(camera_index, copy);   /* takes ownership */
+            }
+        }
+    }
+
+    /* Hand the response to whoever is waiting on this seq — scoped to the
+     * camera it arrived on, same as the DUML path. */
+    bool delivered = false;
+    if (xSemaphoreTake(s_map_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        entry_t *entry = find_entry_by_seq(frame.seq, camera_index);
+        if (entry) {
+            entry->parse_result = parsed;
+            entry->parse_result_length = parsed_len;
+            xSemaphoreGive(entry->sem);
+            delivered = true;
+        }
+        xSemaphoreGive(s_map_mutex);
+    }
+    if (!delivered) {
+        free(parsed);
+    }
+}
+
 /**
  * @brief Process one BLE notification, which may carry several DUML frames
  *
@@ -1185,11 +1284,28 @@ static void process_notification_data(int camera_index, const uint8_t *raw_data,
         const uint8_t *p = raw_data + offset;
         size_t remaining = raw_data_length - offset;
 
+        /*
+         * SOF dispatch. Both framings share this link: an Action body sends
+         * DUML 0x55 status AND R-SDK 0xAA command responses / 0x1D status,
+         * which is why decode is keyed off the frame, never off the slot's
+         * engine. Keying it off the engine would throw away the DUML status an
+         * Action camera already sends.
+         */
+        if (p[0] == RSDK_SOF) {
+            process_rsdk_frame(camera_index, p, remaining);
+            return;   /* R-SDK frames are not coalesced with DUML ones */
+        }
+
         if (p[0] != DUML_SOF) {
-            /* Not DUML (e.g. R-SDK 0xAA, which the Nano does not speak).
-             * Nothing reliable to resync on, so stop. */
-            ESP_LOGD(TAG, "Ignoring non-DUML data at offset %u (SOF 0x%02X)",
-                     (unsigned)offset, p[0]);
+            static bool reported[DATA_MAX_CAMERAS][256];
+            if (camera_index >= 0 && camera_index < DATA_MAX_CAMERAS &&
+                !reported[camera_index][p[0]]) {
+                reported[camera_index][p[0]] = true;
+                ESP_LOGW(TAG, "cam%d: unknown framing, SOF 0x%02X (%u bytes) — dropped",
+                         camera_index, p[0], (unsigned)remaining);
+                ESP_LOG_BUFFER_HEX_LEVEL(TAG, p, remaining > 32 ? 32 : remaining,
+                                         ESP_LOG_WARN);
+            }
             return;
         }
 

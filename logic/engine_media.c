@@ -55,7 +55,7 @@ static esp_err_t media_set_mode(int slot, cam_mode_t mode)
     return command_logic_set_shoot_mode(slot, osmo);
 }
 
-cam_mode_t media_mode_from_wire(uint8_t wire)
+cam_mode_t cam_mode_from_dji_wire(uint8_t wire)
 {
     switch (wire) {
         case OSMO_MODE_VIDEO:      return CAM_MODE_VIDEO;

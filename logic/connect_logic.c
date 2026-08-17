@@ -537,19 +537,19 @@ int connect_logic_protocol_connect(int camera_index, uint32_t device_id, uint8_t
 
     g_camera_states[camera_index].engine = camera_engine_from_advert(adv_id, dev_name);
 
-    if (g_camera_states[camera_index].engine == &g_engine_media) {
-        ESP_LOGI(TAG, "Camera %d: engine=media (adv model id 0x%04X, %s)",
-                 camera_index, (unsigned int)adv_id,
-                 scanned_id ? "this scan" : "stored at pairing");
+    if (g_camera_states[camera_index].engine != NULL) {
+        ESP_LOGI(TAG, "Camera %d: engine=%s (adv model id 0x%04X, %s)",
+                 camera_index, g_camera_states[camera_index].engine->name,
+                 (unsigned int)adv_id, scanned_id ? "this scan" : "stored at pairing");
     } else {
         /*
-         * Not a known media body. Most likely Action-family — which identifies
-         * itself in the reply to the R-SDK connection request (0x00/0x19). The
-         * probe runs after the link is up, further down; until it answers the
-         * slot stays unresolved and commands refuse, which is the intended
-         * failure mode, NOT a silent fallback to DUML.
+         * Not identifiable from the advertisement. Most likely an Action body
+         * whose model id we have not catalogued — it identifies itself in the
+         * reply to the R-SDK connection request (0x00/0x19), probed further
+         * down. Until that answers the slot stays unresolved and commands
+         * refuse, which is the intended failure mode, NOT a fallback to DUML.
          */
-        ESP_LOGI(TAG, "Camera %d: not a known media body (adv 0x%04X, '%s') — "
+        ESP_LOGI(TAG, "Camera %d: unidentified advert (0x%04X, '%s') — "
                       "will ask via R-SDK connection request",
                  camera_index, (unsigned int)adv_id, dev_name ? dev_name : "?");
     }
@@ -707,6 +707,25 @@ int connect_logic_protocol_connect(int camera_index, uint32_t device_id, uint8_t
             ESP_LOGW(TAG, "Camera %d: engine UNRESOLVED — commands will refuse. "
                           "Neither a known media advert nor an R-SDK identity.",
                      camera_index);
+        }
+    }
+
+    /*
+     * Let the engine finish its own bring-up, now that we know which one it is.
+     *
+     * This call site did not exist until an OA6 proved it was needed: the R-SDK
+     * status push must be subscribed to (0x1D/0x05) or the camera never reports
+     * recording state, whereas a media body streams unasked. session_open() was
+     * on the interface from the start with nothing invoking it.
+     */
+    {
+        const camera_engine_t *e = g_camera_states[camera_index].engine;
+        if (e != NULL && e->session_open != NULL) {
+            esp_err_t oerr = e->session_open(camera_index);
+            if (oerr != ESP_OK) {
+                ESP_LOGW(TAG, "Camera %d: %s session_open failed: %s",
+                         camera_index, e->name, esp_err_to_name(oerr));
+            }
         }
     }
 

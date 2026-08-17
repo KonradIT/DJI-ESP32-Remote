@@ -24,4 +24,8 @@ void update_camera_state_handler(int camera_index, void *data);
 
 void update_new_camera_state_handler(int camera_index, void *data);
 
+/* R-SDK 0x1D/0x02 camera status push — the 0xAA counterpart to the DUML
+ * 0x02/0x80 handler. Borrows `data`; the caller keeps ownership. */
+void update_camera_state_rsdk(int camera_index, const void *data, size_t len);
+
 #endif

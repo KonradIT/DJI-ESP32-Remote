@@ -31,6 +31,7 @@
 #define RSDK_CMDSET_CAMERA        0x1D
 #define RSDK_CMDID_MODE_SWITCH    0x04
 #define RSDK_CMDID_RECORD_CTRL    0x03
+#define RSDK_CMDID_STATUS_SUBSCRIBE 0x05   /* on cmd set 0x1D */
 #define RSDK_CMDID_KEY_REPORT     0x11   /* on cmd set 0x00, not 0x1D */
 
 /* Key codes carried by 0x00/0x11. QS is context-dependent ON THE CAMERA: a
@@ -240,11 +241,58 @@ static esp_err_t rsdk_mode_cycle(int slot)
 
 static esp_err_t rsdk_session_open(int slot)
 {
-    /* connect_logic performs the 0x00/0x19 connection request, which is also
-     * what identifies the body as R-SDK in the first place (its reply carries
-     * the device_id). Nothing further is needed here. */
-    (void)slot;
-    return ESP_OK;
+    /*
+     * Subscribe to the camera status push (0x1D/0x05).
+     *
+     * REQUIRED, and the reason an Action camera showed battery but never a
+     * recording flag even after the SOF dispatcher landed: unlike a Nano —
+     * which starts pushing 0x02/0x80 the moment notifications are enabled —
+     * an R-SDK body sends 0x1D/0x02 only once asked. Without this the remote
+     * can command the camera and read nothing back, so recording never
+     * registers and the shutter never offers Stop.
+     *
+     * The subscribe call was deleted during the DUML-only port, correctly at
+     * the time: DUML genuinely does not need it. It has to come back now that
+     * both protocols run side by side. push_freq is in 0.1 Hz units and the
+     * protocol only accepts 20 (= 2 Hz).
+     */
+    /*
+     * The connection request comes FIRST. An OA6 accepts the subscribe with
+     * ret_code 00 and then pushes nothing at all unless it has been through
+     * 0x00/0x19 — being a registered controller is evidently what earns the
+     * status stream, not the subscription on its own.
+     *
+     * This became necessary the moment identity started coming from the
+     * advertisement: resolving the engine from 0x0018 meant route 3 never ran,
+     * so the handshake that used to happen as a side effect of asking "who are
+     * you?" silently stopped happening. Worth noting the probe only works at
+     * all now that the SOF dispatcher exists — its 0xAA reply used to be
+     * discarded, which is why it always reported "not an R-SDK body".
+     */
+    if (g_camera_states[slot].device_id == 0) {
+        uint32_t id = 0;
+        if (rsdk_probe_identity(slot, &id) == ESP_OK) {
+            g_camera_states[slot].device_id = id;
+            const char *model = ui_get_camera_model_name(id);
+            strncpy(g_camera_states[slot].model_name, model,
+                    sizeof(g_camera_states[slot].model_name) - 1);
+            g_camera_states[slot].model_name[
+                sizeof(g_camera_states[slot].model_name) - 1] = '\0';
+            ESP_LOGI(TAG, "Camera %d: connection request OK — %s (0x%04X)",
+                     slot, model, (unsigned)id);
+        } else {
+            ESP_LOGW(TAG, "Camera %d: no connection-request reply; status push "
+                          "may not start", slot);
+        }
+    }
+
+    camera_status_subscription_command_frame body = {
+        .push_mode = PUSH_MODE_PERIODIC_WITH_STATE_CHANGE,
+        .push_freq = PUSH_FREQ_2HZ,
+        .reserved  = {0},
+    };
+    ESP_LOGI(TAG, "Camera %d: subscribing to status push (0x1D/0x05, 2 Hz)", slot);
+    return rsdk_send(slot, RSDK_CMDID_STATUS_SUBSCRIBE, &body);
 }
 
 const camera_engine_t g_engine_rsdk = {

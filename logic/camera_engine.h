@@ -187,17 +187,17 @@ esp_err_t rsdk_key_report(int slot, uint8_t key_code, uint8_t mode, uint8_t key_
 const char *cam_mode_name(cam_mode_t mode);
 
 /*
- * Decode a shooting mode out of a DUML 0x02/0x80 status push (byte
- * OSMO_STATUS_MODE) into the neutral enum.
+ * Decode a DJI shooting-mode byte into the neutral enum.
  *
- * Lives on the media engine because the byte is a media wire value. Note the
- * status push itself is DUML on BOTH families — Action bodies emit it too —
- * so this is also what decodes an Action camera's mode today. Whether the
- * encoding truly matches across families is UNVERIFIED; it is what the code
- * has always assumed, now stated explicitly instead of implied by storing a
- * raw byte in shared state.
+ * ✅ The two families share this numbering — 0x00 SlowMo, 0x01 Video, 0x02
+ * TimeLapse, 0x05 Photo, 0x0A HyperLapse, 0x28 low-light/SuperNight. Confirmed
+ * from DJI's own R-SDK definition (camera_status_push_command_frame.camera_mode
+ * in dji_protocol_data_structures.h) matching the media values pinned on a Nano
+ * by A-B-A. This used to be flagged UNVERIFIED and assumed; it no longer is,
+ * which is why one decoder legitimately serves both the DUML 0x02/0x80 push and
+ * the R-SDK 0x1D/0x02 push.
  */
-cam_mode_t media_mode_from_wire(uint8_t wire);
+cam_mode_t cam_mode_from_dji_wire(uint8_t wire);
 
 /* The engine bound to a slot, or NULL if unresolved. Never guesses. */
 const camera_engine_t *camera_engine_for_slot(int slot);
