@@ -1253,6 +1253,22 @@ static void process_rsdk_frame(int camera_index, const uint8_t *p, size_t len)
     bool delivered = false;
     if (xSemaphoreTake(s_map_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         entry_t *entry = find_entry_by_seq(frame.seq, camera_index);
+        if (entry == NULL && (frame.cmd_type & OSMO_FLAGS_IS_ACK_BIT) == 0) {
+            /*
+             * Camera-ORIGINATED request, not a reply to anything of ours.
+             * The R-SDK connection handshake needs this: at step 3 the camera
+             * sends its own 0x00/0x19, and we must both read it and echo its
+             * seq back. Without an entry keyed by cmd_set/cmd_id there is
+             * nothing for data_wait_for_result_by_cmd() to find, and the
+             * handshake stalls at exactly the point the camera is waiting on
+             * us — which looks like the camera ignoring us.
+             */
+            entry = allocate_entry_by_cmd(cmd_set, cmd_id, camera_index);
+            if (entry) {
+                entry->seq = frame.seq;   /* the waiter needs THIS seq to ack */
+                entry->last_access_time = xTaskGetTickCount();
+            }
+        }
         if (entry) {
             entry->parse_result = parsed;
             entry->parse_result_length = parsed_len;

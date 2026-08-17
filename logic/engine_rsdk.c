@@ -47,7 +47,13 @@
 #define RSDK_RECORD_START         0x00
 #define RSDK_RECORD_STOP          0x01
 
-extern uint32_t g_device_id;   /* this remote's own id, set at boot from NVS */
+/* This remote's own protocol identity, defined in main/ui.c. Not declared in a
+ * header there, so the handshake picks them up by extern like g_device_id. */
+extern uint32_t g_device_id;
+extern uint8_t  g_mac_addr_len;
+extern int8_t   g_mac_addr[6];
+extern uint32_t g_fw_version;
+extern uint8_t  g_verify_mode;
 
 static uint16_t rsdk_seq(void)
 {
@@ -61,6 +67,39 @@ static uint16_t rsdk_seq(void)
  * and mode are trusted solely from the camera's own status push. That is true
  * of BOTH protocols, so the UI can treat them the same way.
  */
+/*
+ * Same, but with the frame's cmd_type and seq chosen by the caller.
+ *
+ * The handshake needs both: its opening request is CMD_WAIT_RESULT, and its
+ * closing frame is an ACK that must carry the SEQ THE CAMERA CHOSE, not one of
+ * ours — an ack with a fresh seq answers nothing.
+ */
+static esp_err_t rsdk_send_typed(int slot, uint8_t cmd_set, uint8_t cmd_id,
+                                 uint8_t cmd_type, const void *body, uint16_t seq,
+                                 bool expect_reply)
+{
+    if (slot < 0 || slot >= NUM_CAMERAS || !ble_is_camera_connected(slot)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    size_t   frame_len = 0;
+    uint8_t *frame = protocol_create_frame(cmd_set, cmd_id, cmd_type, body, seq, &frame_len);
+    if (frame == NULL) {
+        return ESP_FAIL;
+    }
+    /*
+     * expect_reply picks the write that REGISTERS the seq. Only
+     * data_write_with_response() allocates a tracking entry; without one the
+     * camera's answer arrives, finds nothing waiting, and is dropped — which
+     * looked exactly like the camera never answering. Confirmed on an OA6: the
+     * reply was in the log 1.9 s before our own timeout fired.
+     */
+    esp_err_t ret = expect_reply
+                        ? data_write_with_response(slot, seq, frame, frame_len)
+                        : data_write_without_response(slot, seq, frame, frame_len);
+    free(frame);
+    return ret;
+}
+
 static esp_err_t rsdk_send_set(int slot, uint8_t cmd_set, uint8_t cmd_id, const void *body)
 {
     if (slot < 0 || slot >= NUM_CAMERAS) {
@@ -134,7 +173,10 @@ esp_err_t rsdk_probe_identity(int slot, uint32_t *out_device_id)
                                            CMD_RESPONSE_OR_NOT, &body, seq, &frame_len);
     if (frame == NULL) return ESP_FAIL;
 
-    esp_err_t ret = data_write_without_response(slot, seq, frame, frame_len);
+    /* with_response, because it is what registers the seq — see rsdk_send_typed.
+     * With the plain write this probe could never succeed: the camera's reply
+     * had nowhere to land, so every Action body was reported as "not R-SDK". */
+    esp_err_t ret = data_write_with_response(slot, seq, frame, frame_len);
     free(frame);
     if (ret != ESP_OK) return ret;
 
@@ -239,6 +281,110 @@ static esp_err_t rsdk_mode_cycle(int slot)
     return rsdk_key_report(slot, RSDK_KEY_QS, RSDK_KEY_MODE_EVENTS, RSDK_KEY_SHORT_PRESS);
 }
 
+/*
+ * The R-SDK connection handshake — 0x00/0x19, four steps, BIDIRECTIONAL.
+ *
+ * Transcribed from a capture of the `main` firmware, which drives an OA6
+ * correctly. Getting only the first half of this is why an Action camera
+ * accepted our status subscribe with ret_code 00 and then pushed nothing: it
+ * had never registered us as a controller.
+ *
+ *   1. us  -> cam  0x00/0x19 connection_request_command_frame, CMD_WAIT_RESULT
+ *   2. cam -> us   connection_request_response_frame              (handshake ok)
+ *   3. cam -> us   0x00/0x19 as its OWN REQUEST, carrying the camera's
+ *                  device_id (0xFF55 on an OA6) and verify_mode 2. THIS is the
+ *                  "GPS remote connected" prompt on the camera screen.
+ *   4. us  -> cam  0x00/0x19 connection_request_response_frame, ACK_NO_RESPONSE,
+ *                  echoing the seq the CAMERA chose in step 3.
+ *
+ * Step 3 is a human in the loop, hence the 30 s wait — matching the reference
+ * rather than trimming it, since a shorter one races the user. It does block
+ * this slot's connect; that is what the reference does too.
+ */
+static esp_err_t rsdk_handshake(int slot)
+{
+    camera_state_t *cam = &g_camera_states[slot];
+
+    /* STEP 1 */
+    connection_request_command_frame req = {
+        .device_id    = g_device_id,
+        .mac_addr_len = g_mac_addr_len,
+        .fw_version   = g_fw_version,
+        .conidx       = 0,
+        .verify_mode  = g_verify_mode,
+        .verify_data  = cam->verify_data,
+    };
+    memcpy(req.mac_addr, g_mac_addr, sizeof(req.mac_addr) < 6 ? sizeof(req.mac_addr) : 6);
+
+    uint16_t seq = rsdk_seq();
+    ESP_LOGI(TAG, "Camera %d: connection request (0x00/0x19, verify_mode=%u)",
+             slot, (unsigned)g_verify_mode);
+    if (rsdk_send_typed(slot, RSDK_CMDSET_SESSION, RSDK_CMDID_CONN_REQ,
+                        CMD_WAIT_RESULT, &req, seq, true) != ESP_OK) {
+        return ESP_FAIL;
+    }
+
+    /* STEP 2 — the camera's ack of our request. */
+    void  *res = NULL;
+    size_t res_len = 0;
+    if (data_wait_for_result_by_seq(seq, 2000, &res, &res_len) != ESP_OK || res == NULL) {
+        ESP_LOGW(TAG, "Camera %d: no reply to connection request", slot);
+        return ESP_ERR_TIMEOUT;
+    }
+    free(res);
+
+    /* STEP 3 — the camera's own request. Approval happens on the camera. */
+    ESP_LOGI(TAG, "Camera %d: waiting for the camera to confirm the connection "
+                  "(approve on the camera if prompted)", slot);
+    void    *creq = NULL;
+    size_t   creq_len = 0;
+    uint16_t cam_seq = 0;
+    if (data_wait_for_result_by_cmd(RSDK_CMDSET_SESSION, RSDK_CMDID_CONN_REQ,
+                                    30000, &cam_seq, &creq, &creq_len) != ESP_OK ||
+        creq == NULL || creq_len < sizeof(connection_request_command_frame)) {
+        ESP_LOGW(TAG, "Camera %d: camera never sent its connection request", slot);
+        free(creq);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    const connection_request_command_frame *cr =
+        (const connection_request_command_frame *)creq;
+    uint32_t cam_id = cr->device_id;
+    uint8_t  vmode  = cr->verify_mode;
+    uint16_t vdata  = cr->verify_data;
+    free(creq);
+
+    cam->device_id = cam_id;
+    const char *model = ui_get_camera_model_name(cam_id);
+    strncpy(cam->model_name, model, sizeof(cam->model_name) - 1);
+    cam->model_name[sizeof(cam->model_name) - 1] = '\0';
+    ESP_LOGI(TAG, "Camera %d identified as %s (device_id 0x%04X, verify_mode %u)",
+             slot, model, (unsigned)cam_id, (unsigned)vmode);
+
+    if (vmode != 2) {
+        ESP_LOGW(TAG, "Camera %d: unexpected verify_mode %u — not completing",
+                 slot, (unsigned)vmode);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    if (vdata != 0) {
+        ESP_LOGW(TAG, "Camera %d: connection refused (verify_data %u)",
+                 slot, (unsigned)vdata);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    /* STEP 4 — accept, echoing the camera's seq. */
+    connection_request_response_frame ack = {
+        .device_id = g_device_id,
+        .ret_code  = 0,
+    };
+    memset(ack.reserved, 0, sizeof(ack.reserved));
+    ack.reserved[0] = cam->camera_reserved;
+
+    ESP_LOGI(TAG, "Camera %d: accepting connection (ack seq 0x%04X)", slot, cam_seq);
+    return rsdk_send_typed(slot, RSDK_CMDSET_SESSION, RSDK_CMDID_CONN_REQ,
+                           ACK_NO_RESPONSE, &ack, cam_seq, false);
+}
+
 static esp_err_t rsdk_session_open(int slot)
 {
     /*
@@ -269,21 +415,9 @@ static esp_err_t rsdk_session_open(int slot)
      * all now that the SOF dispatcher exists — its 0xAA reply used to be
      * discarded, which is why it always reported "not an R-SDK body".
      */
-    if (g_camera_states[slot].device_id == 0) {
-        uint32_t id = 0;
-        if (rsdk_probe_identity(slot, &id) == ESP_OK) {
-            g_camera_states[slot].device_id = id;
-            const char *model = ui_get_camera_model_name(id);
-            strncpy(g_camera_states[slot].model_name, model,
-                    sizeof(g_camera_states[slot].model_name) - 1);
-            g_camera_states[slot].model_name[
-                sizeof(g_camera_states[slot].model_name) - 1] = '\0';
-            ESP_LOGI(TAG, "Camera %d: connection request OK — %s (0x%04X)",
-                     slot, model, (unsigned)id);
-        } else {
-            ESP_LOGW(TAG, "Camera %d: no connection-request reply; status push "
-                          "may not start", slot);
-        }
+    if (rsdk_handshake(slot) != ESP_OK) {
+        ESP_LOGW(TAG, "Camera %d: R-SDK handshake incomplete — subscribing anyway, "
+                      "but the camera will likely stay silent", slot);
     }
 
     camera_status_subscription_command_frame body = {
