@@ -112,14 +112,16 @@ const size_t OSMO_CFG_NAMES_COUNT =
  * Mirrors what DJI Mimo / osmo-download present as the app's device info.
  */
 const uint8_t OSMO_APP_DEVICE_INFO[OSMO_APP_DEVICE_INFO_LEN] = {
+    /* [0..3]  type byte + "APP" */
     0x00, 'A', 'P', 'P',
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0,
-    0x02,
-    0, 0, 0, 0, 0, 0, 0, 0,
-    0x02, 0x08,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,    0,    0,    0,    0, 0, 0, 0, 0, 0, 0, 0,
+    0,    0,    0,    0,    0, 0, 0, 0, 0, 0, 0, 0,
+    0,    0,
+    /* [34] */ 0x02,
+    0,    0,    0,    0,    0, 0, 0,
+    /* [42..43] */ 0x02, 0x08,
+    0,    0,    0,    0,    0, 0, 0, 0, 0, 0,
+    0,    0,    0,    0,    0, 0, 0, 0, 0, 0,
 };
 
 /*

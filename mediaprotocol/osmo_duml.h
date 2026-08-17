@@ -265,7 +265,16 @@ extern const uint8_t OSMO_SESSION_KEEPALIVE[2];  /* 01 01 — ~1 Hz forever  */
 extern const uint8_t OSMO_PARAM_GET_0014[4];
 
 /* 62-byte "APP" identity blob answering the camera's 0x00/0x81 request */
-#define OSMO_APP_DEVICE_INFO_LEN 62
+/*
+ * 64, not 62. Taken byte-for-byte from DJI Mimo answering a Pocket 3's
+ * 0x00/0x81 device-info request (mimo_op3_playback pcap): the reply is 64 bytes
+ * with markers at [34] and [42..43]. Our hand-built version was 62 bytes with
+ * those markers at [41] and [50..51] — right shape, wrong length and offsets.
+ * A Nano accepts the malformed one; a Pocket 3 asks 31 times and never
+ * authorises control, which is what "status works, no command is obeyed" looks
+ * like from this side.
+ */
+#define OSMO_APP_DEVICE_INFO_LEN 64
 extern const uint8_t OSMO_APP_DEVICE_INFO[OSMO_APP_DEVICE_INFO_LEN];
 
 /*
