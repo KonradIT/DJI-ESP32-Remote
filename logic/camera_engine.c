@@ -33,27 +33,32 @@ static bool name_has_ci(const char *hay, const char *needle)
 const camera_engine_t *camera_engine_from_advert(uint32_t adv_model_id,
                                                  const char *adv_name)
 {
-    /* Route 1 — the model id off the air. Hardware-confirmed for the Nano:
-     * mfg[2..3] little-endian under DJI company id 0x08AA reads 0x0019. */
-    if (adv_model_id == CAM_ADV_MODEL_OSMO_NANO) {
-        return &g_engine_media;
+    /*
+     * The model id off the air — every id below is hardware-confirmed from our
+     * own scan logs, not inferred from a family or a naming pattern.
+     */
+    switch (adv_model_id) {
+        case CAM_ADV_MODEL_OSMO_NANO:      /* 0x0019, confirmed */
+        case CAM_ADV_MODEL_OSMO_POCKET3:   /* 0x0020, confirmed */
+            return &g_engine_media;
+
+        case CAM_ADV_MODEL_OSMO_ACTION6:   /* 0x0018, confirmed */
+            return &g_engine_rsdk;
+
+        default:
+            break;
     }
 
     /*
-     * Route 2 — the one name-based exception. A Pocket 3 reportedly sends no
-     * manufacturer data at all, so no model id can ever appear for it and a
-     * name match is the only pre-connect signal available.
-     *
-     * ⚠ UNVERIFIED: we have never captured a Pocket 3 advertisement. If one
-     * turns out to carry mfg data, delete this branch and add its model id to
-     * route 1 instead — a name match is weaker and should not outlive its
-     * necessity.
+     * The name-based Pocket exception that used to live here is GONE. It
+     * existed on the belief that a Pocket 3 sends no manufacturer data, so a
+     * name match was the only pre-connect signal. A Pocket 3 capture disproved
+     * that outright — it advertises 0x0020, before we connect — so the id
+     * above replaces it. Matching on a name is guessing dressed up as
+     * identification; do not reintroduce it.
      */
-    if (name_has_ci(adv_name, "pocket")) {
-        ESP_LOGW(TAG, "'%s' matched the name-based Pocket exception -> media",
-                 adv_name ? adv_name : "?");
-        return &g_engine_media;
-    }
+    (void)name_has_ci;
+    (void)adv_name;
 
     /* Not identifiable from the advertisement. The caller should ask via the
      * R-SDK connection request rather than assume. */

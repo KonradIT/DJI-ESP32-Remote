@@ -984,7 +984,12 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
         uint16_t attr_handle = event->notify_rx.attr_handle;
         uint16_t data_len = OS_MBUF_PKTLEN(event->notify_rx.om);
         s_last_rx_us = esp_timer_get_time();
-        ESP_LOGI(TAG, "NOTIFY_RX: conn_handle=%d attr_handle=0x%x len=%d ind=%d",
+        /* DEBUG, not INFO: this fires for every notification from every camera
+         * (~30/s with three connected) and was 37k of a 103k-line capture —
+         * enough to saturate the 115200 console and drop the lines that
+         * actually mattered. The decoded per-frame trace behind
+         * DEBUG_DUML_PACKETS carries the same information with context. */
+        ESP_LOGD(TAG, "NOTIFY_RX: conn_handle=%d attr_handle=0x%x len=%d ind=%d",
                  conn_handle, attr_handle, data_len, event->notify_rx.indication);
 
         profile = get_profile_by_conn_id(conn_handle);

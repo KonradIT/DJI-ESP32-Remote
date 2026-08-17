@@ -2643,40 +2643,42 @@ void ui_screen_main(void) {
              cam_mode_name(cam_state->shoot_mode), cam_state->camera_status,
              cam_state->is_recording ? "yes" : "no");
 
+    /*
+     * Everything below goes through the ENGINE. This block used to call
+     * command_logic_take_photo() / _start_record() / _stop_record() directly —
+     * the raw DUML implementations — so selecting an Action camera and pressing
+     * the shutter sent it a media 0x02/0x02 frame it does not speak. Hardware
+     * capture, OA6 in slot 1:
+     *     Single camera mode - camera 1 selected
+     *     LOGIC_COMMAND: Camera 1: start recording (0x02/0x02 [01])
+     * The all-cameras path already dispatched correctly, which is exactly why
+     * the same camera recorded there and nowhere else.
+     *
+     * The result only reports whether the command was SENT. Recording state
+     * comes from the camera's status push, never from this return.
+     */
     if (cam_state->shoot_mode == CAM_MODE_PHOTO) {
-        /* Photo mode — shutter (0x02/0x01 [01]). Fire-and-forget: the camera
-         * completes a burst or interval sequence on its own, so there is no
-         * stop and no recording state to toggle. */
+        /* Photo mode — the camera completes a burst or interval sequence on
+         * its own, so there is no stop and no recording state to toggle. */
         ESP_LOGI(TAG, "Taking photo in photo mode");
-        if (command_logic_take_photo(cam_idx) == ESP_OK) {
+        if (command_logic_shutter_async(cam_idx) == ESP_OK) {
             ui_show_shutter_bottom_message("Photo Taken", M5_COLOR_GREEN, 1000);
         } else {
             ui_show_shutter_bottom_message("Photo Failed", M5_COLOR_RED, 1500);
         }
-    } else {
-        /* Video modes - toggle recording state */
-        bool is_recording = cam_state->is_recording;
-        
-        if (is_recording) {
-            /* Stop current recording */
-            ESP_LOGI(TAG, "Stopping recording in video mode");
-            record_control_response_frame_t* response = command_logic_stop_record(cam_idx);
-            if (response) {
-                ui_show_shutter_bottom_message("Recording Stopped", M5_COLOR_YELLOW, 1000);
-                free(response);
-            } else {
-                ui_show_shutter_bottom_message("Stop Failed", M5_COLOR_RED, 1500);
-            }
+    } else if (cam_state->is_recording) {
+        ESP_LOGI(TAG, "Stopping recording in video mode");
+        if (command_logic_stop_record_async(cam_idx) == ESP_OK) {
+            ui_show_shutter_bottom_message("Recording Stopped", M5_COLOR_YELLOW, 1000);
         } else {
-            /* Start new recording */
-            ESP_LOGI(TAG, "Starting recording in video mode");
-            record_control_response_frame_t* response = command_logic_start_record(cam_idx);
-            if (response) {
-                ui_show_shutter_bottom_message("Recording Started", M5_COLOR_GREEN, 1000);
-                free(response);
-            } else {
-                ui_show_shutter_bottom_message("Start Failed", M5_COLOR_RED, 1500);
-            }
+            ui_show_shutter_bottom_message("Stop Failed", M5_COLOR_RED, 1500);
+        }
+    } else {
+        ESP_LOGI(TAG, "Starting recording in video mode");
+        if (command_logic_start_record_async(cam_idx) == ESP_OK) {
+            ui_show_shutter_bottom_message("Recording Started", M5_COLOR_GREEN, 1000);
+        } else {
+            ui_show_shutter_bottom_message("Start Failed", M5_COLOR_RED, 1500);
         }
     }
 }

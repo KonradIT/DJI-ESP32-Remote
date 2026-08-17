@@ -39,7 +39,12 @@ extern "C" {
  * a new camera body).
  */
 #ifndef DEBUG_DUML_PACKETS
-#define DEBUG_DUML_PACKETS 1   /* TEMP */
+/* Off by default: the per-frame hex dump was 20k lines of a 103k-line
+ * three-camera capture and saturates the 115200 console, which drops the very
+ * lines you are reading the log for. The 0x02 command ACKs are logged at INFO
+ * in data.c regardless, so the reply-byte oracle survives without this. Turn
+ * on for frame-level RE, not for functional testing. */
+#define DEBUG_DUML_PACKETS 0
 #endif
 
 /* Flags (cmd_type byte) as seen on the BLE wire */

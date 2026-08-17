@@ -135,7 +135,20 @@ extern const camera_engine_t g_engine_media;
  * Route 3 is why we need no catalogue of Action-family advertisement ids: the
  * handshake self-identifies and hands us the exact model for free.
  */
-#define CAM_ADV_MODEL_OSMO_NANO   0x0019
+/*
+ * Advertised model ids, all read off the air from the cameras themselves
+ * (DJI mfg data, company id 0x08AA, mfg[2..3] LE).
+ *
+ * ⚠ The Action family advertises these too. The original plan assumed only
+ * media bodies did and that Action cameras would have to be asked via the
+ * R-SDK connection request — an OA6 capture disproved it, showing 0x0018
+ * before any connection. Identifying from the advert is strictly better: it
+ * happens before we send the camera anything, and it does not depend on the
+ * command path working.
+ */
+#define CAM_ADV_MODEL_OSMO_NANO      0x0019
+#define CAM_ADV_MODEL_OSMO_POCKET3   0x0020
+#define CAM_ADV_MODEL_OSMO_ACTION6   0x0018
 
 #define RSDK_DEVICE_ID_ACTION4    0xFF33
 #define RSDK_DEVICE_ID_ACTION5    0xFF44

@@ -68,6 +68,23 @@
  */
 #define MAX_SEQ_ENTRIES 10
 
+/*
+ * Depth of the inbound notification queue.
+ *
+ * Its own constant. This used to be created with MAX_SEQ_ENTRIES — the
+ * pending-COMMAND table size — which is an unrelated quantity that merely
+ * happened to be a number. Ten slots cannot absorb three cameras pushing
+ * status at ~10 Hz plus config blobs: a three-camera capture dropped 30,955
+ * notifications, starting the instant the second camera connected, and
+ * starved the connect sequence badly enough that one camera took 195 s to
+ * finish its DUML session.
+ *
+ * Each slot costs sizeof(notify_data_t) (~12 B) in the queue itself; the
+ * payloads are malloc'd and freed by the consumer, so depth bounds worst-case
+ * heap in flight rather than steady-state use.
+ */
+#define NOTIFY_QUEUE_DEPTH 64
+
 /* Cleanup timer interval for expired entry removal
  * Runs every 60 seconds to clean up stale command entries
  */
@@ -558,7 +575,7 @@ void data_init(void) {
     }
 
     // Initialize notification queue
-    notify_queue = xQueueCreate(MAX_SEQ_ENTRIES, sizeof(notify_data_t));
+    notify_queue = xQueueCreate(NOTIFY_QUEUE_DEPTH, sizeof(notify_data_t));
     if (notify_queue == NULL) {
         ESP_LOGE(TAG, "Failed to create notification queue");
     }
@@ -1043,6 +1060,40 @@ static void handle_duml_frame(int camera_index, duml_frame_t frame) {
 #endif
 
     if (frame.cmd_type & OSMO_FLAGS_IS_ACK_BIT) {
+        /*
+         * Surface the reply byte for the camera-control commands, at INFO and
+         * without the full frame firehose behind DEBUG_DUML_PACKETS.
+         *
+         * Byte 0 of a 0x02 response is the whole diagnosis and the reason
+         * these three get a line of their own:
+         *   00 ok · d9 wrong state · df wrong parameter · e3 bad/missing
+         *   parameter · e0 unsupported · (no line at all) = the camera never
+         *   answered, which is a different failure from any of the above.
+         * Photo/record/mode are fire-and-forget, so without this a rejected
+         * command and an ignored one look identical from the log.
+         */
+        if ((frame.cmd_set == OSMO_CMDSET_CAMERA &&
+             (frame.cmd_id == OSMO_CMDID_TAKE_PHOTO ||
+              frame.cmd_id == OSMO_CMDID_SET_MODE ||
+              frame.cmd_id == OSMO_CMDID_SET_SHOOT_MODE)) ||
+            (frame.cmd_set == OSMO_CMDSET_WIFI &&
+             frame.cmd_id == OSMO_CMDID_SET_PAIRING)) {
+            /*
+             * The pairing reply is logged here, unconditionally, because
+             * connect_logic only waits 800 ms for it and a later one is
+             * matched against an expired entry and dropped without trace. A
+             * Pocket 3 session came up paired=0 and we could not tell whether
+             * it answered late or never — this line answers that.
+             * For 0x07/0x45 the meaningful byte is payload[1]: 1 = already
+             * paired, 2 = approval popup shown on the camera.
+             */
+            ESP_LOGI(TAG, "cam%d ACK 0x%02X/0x%02X -> %02X %02X (plen=%u)",
+                     camera_index, frame.cmd_set, frame.cmd_id,
+                     frame.payload_len > 0 ? frame.payload[0] : 0x00,
+                     frame.payload_len > 1 ? frame.payload[1] : 0x00,
+                     frame.payload_len);
+        }
+
         /* Response frame — find the waiter by seq */
         bool delivered = false;
         if (xSemaphoreTake(s_map_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -1078,6 +1129,14 @@ static void handle_duml_frame(int camera_index, duml_frame_t frame) {
     }
 
     if (frame.cmd_type & OSMO_FLAGS_REQUEST) {
+        /* The user tapping "approve" on the camera arrives here, not as a
+         * reply — so it is the only positive confirmation that a session is
+         * actually authorised. Worth a line of its own. */
+        if (frame.cmd_set == OSMO_CMDSET_WIFI &&
+            frame.cmd_id == OSMO_CMDID_PAIR_APPROVED) {
+            ESP_LOGI(TAG, "cam%d pairing APPROVED on camera (0x07/0x46)", camera_index);
+        }
+
         /* Camera-originated request. Deliver to any cmd-based waiter first
          * (pairing approval 0x07/0x46 arrives as a request), then ack it. */
         if (xSemaphoreTake(s_map_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -1182,9 +1241,27 @@ void receive_camera_notify_handler(int camera_index, const uint8_t *raw_data, si
         .data_length = raw_data_length
     };
 
-    // Send to queue for processing in task context
+    /*
+     * Send to queue for processing in task context.
+     *
+     * Drops are counted and reported periodically rather than per event. When
+     * this queue overflows it overflows thousands of times, and logging each
+     * one floods the same serial link we diagnose from — the previous capture
+     * spent 31k of its 103k lines on this message alone, which cost more
+     * information than it conveyed.
+     */
     if (xQueueSend(notify_queue, &notify_data, 0) != pdTRUE) {
-        ESP_LOGE(TAG, "Camera %d: Failed to queue notification data", camera_index);
+        static uint32_t dropped;
+        static uint32_t last_report_tick;
+        TickType_t now = xTaskGetTickCount();
+        dropped++;
+        if (last_report_tick == 0 ||
+            (now - last_report_tick) >= pdMS_TO_TICKS(5000)) {
+            last_report_tick = now;
+            ESP_LOGW(TAG, "Notification queue full — %lu dropped so far "
+                          "(depth %d); most recent camera %d",
+                     (unsigned long)dropped, NOTIFY_QUEUE_DEPTH, camera_index);
+        }
         free(data_copy);
     }
 }
